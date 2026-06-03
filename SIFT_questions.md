@@ -336,6 +336,27 @@ RAISED: June 2026
 
 ---
 
+Q: Should SIFT show a progress bar during scanning?
+A: Yes. Users need feedback. Currently no progress bar shows during scan. Machine appears frozen.
+STATUS: Open
+RAISED: June 2026
+
+---
+
+Q: Should SIFT show total file count before scanning starts?
+A: Yes. User needs to know scale of what is being scanned.
+STATUS: Open
+RAISED: June 2026
+
+---
+
+Q: Should SIFT show current file number and name during scan?
+A: Yes. Shows the scan is alive and progressing.
+STATUS: Open
+RAISED: June 2026
+
+---
+
 *Last updated: June 2026*
 *This file is never finished. Every new question is progress.*
 *The questions are the product.*
