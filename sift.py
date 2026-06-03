@@ -1,12 +1,17 @@
-import os, sys, re, platform, zipfile, hashlib, datetime, pickle, mimetypes
+import os, sys, re, time, platform, zipfile, hashlib, datetime, mimetypes
 from pathlib import Path
 
-# ── Version ──────────────────────────────────────────────────────────────────
-VERSION = "2.0"
+# ── Version ───────────────────────────────────────────────────────────────────
+VERSION = "2.2"
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 SCRIPT_NAME     = os.path.basename(__file__)
-CHECKPOINT_FILE = "sift_checkpoint.pkl"
+SCRIPT_DIR      = Path(os.path.dirname(os.path.abspath(__file__)))
+STORE_FILENAME  = 'sift_content_store.txt'   # plain text — no pickle, no memory spike
+
+# Throttle: pause between files so the machine stays responsive
+# 0.003 = 3ms per file. On 10,000 files = 30 seconds added. Safe for slow drives.
+THROTTLE_DELAY  = 0.003
 
 # Extensions Python can read as plain text
 TEXT_EXTENSIONS = {
@@ -44,7 +49,6 @@ SYSTEM_DIRS = {
     'Adobe','.tmp.driveupload','.tmp.drivedownload',
 }
 
-SKIP_DIRS = SYSTEM_DIRS
 
 # ── Redaction patterns ────────────────────────────────────────────────────────
 REDACT_PATTERNS = [
@@ -66,7 +70,8 @@ def redact(text):
             pass
     return text
 
-# ── Detect language from extension ───────────────────────────────────────────
+
+# ── Language detection ────────────────────────────────────────────────────────
 LANG_MAP = {
     '.py':'Python', '.js':'JavaScript', '.ts':'TypeScript',
     '.jsx':'React/JSX', '.tsx':'React/TSX', '.html':'HTML',
@@ -80,6 +85,7 @@ LANG_MAP = {
 def detect_language(path):
     return LANG_MAP.get(Path(path).suffix.lower(), 'Unknown')
 
+
 # ── File reader ───────────────────────────────────────────────────────────────
 def read_file(path):
     for enc in ['utf-8', 'latin-1', 'cp1252', 'utf-16']:
@@ -90,59 +96,54 @@ def read_file(path):
             continue
     return None
 
-# ── Build index entry for every file ─────────────────────────────────────────
+
+# ── Index entry builder ───────────────────────────────────────────────────────
 def build_index_entry(fpath, readable, content=None, error=None):
     try:
         stat       = fpath.stat()
         size_bytes = stat.st_size
         modified   = datetime.datetime.fromtimestamp(stat.st_mtime).strftime('%d %b %Y %H:%M')
         created    = datetime.datetime.fromtimestamp(stat.st_ctime).strftime('%d %b %Y %H:%M')
-        size_label = f"{size_bytes}b" if size_bytes < 1024 else f"{size_bytes//1024}kb" if size_bytes < 1024*1024 else f"{size_bytes//1024//1024}mb"
+        size_label = (f"{size_bytes}b" if size_bytes < 1024
+                      else f"{size_bytes//1024}kb" if size_bytes < 1024*1024
+                      else f"{size_bytes//1024//1024}mb")
     except Exception:
-        size_bytes = 0
-        modified   = 'unavailable'
-        created    = 'unavailable'
-        size_label = 'unavailable'
+        size_bytes, modified, created, size_label = 0, 'unavailable', 'unavailable', 'unavailable'
 
-    entry = []
-    entry.append(f"\nFILE: {fpath}")
-    entry.append(f"TYPE: {detect_language(fpath)} | {fpath.suffix.lower() or 'no extension'}")
-    entry.append(f"SIZE: {size_label}")
-    entry.append(f"CREATED:  {created}")
-    entry.append(f"MODIFIED: {modified}")
-    entry.append(f"READABLE: {'Yes' if readable else 'No'}")
+    entry = [
+        f"\nFILE: {fpath}",
+        f"TYPE: {detect_language(fpath)} | {fpath.suffix.lower() or 'no extension'}",
+        f"SIZE: {size_label}",
+        f"CREATED:  {created}",
+        f"MODIFIED: {modified}",
+        f"READABLE: {'Yes' if readable else 'No'}",
+    ]
 
     if not readable:
         entry.append(f"REASON: {error or 'binary or unsupported format'}")
-        entry.append(f"NOTE: File exists and is indexed. Content not available.")
-    else:
-        if content:
-            lines = content.splitlines()
-            line_count = len(lines)
-            word_count = len(content.split())
-            # First meaningful line
-            first_line = next((l.strip() for l in lines if l.strip() and not l.strip().startswith('#')), '')
-            if first_line:
-                first_line = first_line[:120]
-            # Key signals
-            todos    = len(re.findall(r'\b(TODO|FIXME|HACK|BUG|XXX)\b', content, re.IGNORECASE))
-            imports  = re.findall(r'^(?:import|from|require|include)\s+(\S+)', content, re.MULTILINE)
-            has_keys = bool(re.search(r'(?:api[_-]?key|password|secret|token)', content, re.IGNORECASE))
+        entry.append("NOTE: File exists and is indexed. Content not available.")
+    elif content:
+        lines      = content.splitlines()
+        todos      = len(re.findall(r'\b(TODO|FIXME|HACK|BUG|XXX)\b', content, re.IGNORECASE))
+        imports    = re.findall(r'^(?:import|from|require|include)\s+(\S+)', content, re.MULTILINE)
+        has_keys   = bool(re.search(r'(?:api[_-]?key|password|secret|token)', content, re.IGNORECASE))
+        first_line = next((l.strip() for l in lines if l.strip() and not l.strip().startswith('#')), '')
 
-            entry.append(f"LINES: {line_count} | WORDS: {word_count}")
-            if first_line:
-                entry.append(f"FIRST LINE: {first_line}")
-            if imports:
-                entry.append(f"IMPORTS: {', '.join(imports[:8])}" + (' ...' if len(imports) > 8 else ''))
-            if todos > 0:
-                entry.append(f"UNFINISHED NOTES: {todos} TODO/FIXME found")
-            if has_keys:
-                entry.append(f"SENSITIVE: Contains credential patterns (will be redacted in content)")
-        else:
-            entry.append(f"NOTE: Empty file")
+        entry.append(f"LINES: {len(lines)} | WORDS: {len(content.split())}")
+        if first_line:
+            entry.append(f"FIRST LINE: {first_line[:120]}")
+        if imports:
+            entry.append(f"IMPORTS: {', '.join(imports[:8])}" + (' ...' if len(imports) > 8 else ''))
+        if todos:
+            entry.append(f"UNFINISHED NOTES: {todos} TODO/FIXME found")
+        if has_keys:
+            entry.append("SENSITIVE: Contains credential patterns (will be redacted in content)")
+    else:
+        entry.append("NOTE: Empty file")
 
     entry.append("-" * 50)
     return '\n'.join(entry)
+
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 INDEX_PROMPT = """
@@ -177,12 +178,12 @@ RULES:
 
 STRUCTURED REPLY FORMAT — use these exact headings:
 
-PROJECT TYPE: 
-WHAT IT DOES: 
-TECHNOLOGIES: 
-AGE AND ACTIVITY: 
-WHAT WORKS: 
-WHAT IS BROKEN OR MISSING: 
+PROJECT TYPE:
+WHAT IT DOES:
+TECHNOLOGIES:
+AGE AND ACTIVITY:
+WHAT WORKS:
+WHAT IS BROKEN OR MISSING:
 CONFIDENCE: [high / medium / low]
 FILES I NEED TO READ:
 - [exact path]
@@ -207,12 +208,12 @@ Read them and complete your analysis.
 
 STRUCTURED REPLY FORMAT — use these exact headings:
 
-PROJECT TYPE: 
-WHAT IT DOES: 
-WHAT WORKS: 
-WHAT IS BROKEN: 
-WHAT IS MISSING: 
-WHAT SHOULD BE BUILT NEXT: 
+PROJECT TYPE:
+WHAT IT DOES:
+WHAT WORKS:
+WHAT IS BROKEN:
+WHAT IS MISSING:
+WHAT SHOULD BE BUILT NEXT:
 CONFIDENCE: [high / medium / low]
 REMAINING UNKNOWNS:
 
@@ -258,215 +259,340 @@ MODEL ANALYSES BELOW
 
 """
 
-# ── Walk all files — index everything ────────────────────────────────────────
-def walk_and_index(scan_roots):
+
+# ── Content store — streaming write, no RAM spike ────────────────────────────
+# Files are written to disk immediately as scanned.
+# Mode 2 reads back specific files by searching the store.
+# No pickle. No dict in memory. Safe on any size machine.
+
+STORE_MARKER_START = "===SIFT_FILE_START==="
+STORE_MARKER_END   = "===SIFT_FILE_END==="
+
+def write_to_store(store_file, fpath, content):
+    store_file.write(f"{STORE_MARKER_START}\n")
+    store_file.write(f"PATH: {fpath}\n")
+    store_file.write(f"{STORE_MARKER_END_HEADER}\n")
+    store_file.write(content)
+    store_file.write(f"\n{STORE_MARKER_END}\n")
+
+STORE_MARKER_END_HEADER = "===SIFT_CONTENT_START==="
+
+def read_from_store(store_path, requested_paths):
+    """Read specific file contents from the text store. No full load into RAM."""
+    found     = {}
+    not_found = list(requested_paths)
+
+    if not store_path.exists():
+        return found, not_found
+
+    req_lower = {p.lower(): p for p in requested_paths}
+    req_names = {Path(p).name.lower(): p for p in requested_paths}
+
+    with open(store_path, 'r', encoding='utf-8', errors='replace') as f:
+        current_path   = None
+        in_content     = False
+        content_lines  = []
+
+        for line in f:
+            line_stripped = line.rstrip('\n')
+
+            if line_stripped == STORE_MARKER_START:
+                current_path  = None
+                in_content    = False
+                content_lines = []
+                continue
+
+            if line_stripped.startswith("PATH: ") and not in_content:
+                current_path = line_stripped[6:].strip()
+                continue
+
+            if line_stripped == STORE_MARKER_END_HEADER:
+                in_content = True
+                continue
+
+            if line_stripped == STORE_MARKER_END:
+                if current_path and in_content:
+                    # Check if this path was requested
+                    cp_lower = current_path.lower()
+                    cp_name  = Path(current_path).name.lower()
+
+                    matched_req = None
+                    if current_path in requested_paths:
+                        matched_req = current_path
+                    elif cp_lower in req_lower:
+                        matched_req = req_lower[cp_lower]
+                    elif cp_name in req_names:
+                        matched_req = req_names[cp_name]
+
+                    if matched_req and matched_req not in found:
+                        found[matched_req] = '\n'.join(content_lines)
+                        if matched_req in not_found:
+                            not_found.remove(matched_req)
+
+                current_path  = None
+                in_content    = False
+                content_lines = []
+                continue
+
+            if in_content:
+                content_lines.append(line_stripped)
+
+    return found, not_found
+
+
+# ── Walk and index — streaming, throttled ─────────────────────────────────────
+def walk_and_index(scan_roots, output_dir):
+    """
+    Walk all files. Write content to disk as we go — no RAM accumulation.
+    Returns stats only, not file contents.
+    """
     if isinstance(scan_roots, str):
         scan_roots = [scan_roots]
 
-    scan_root = Path(scan_roots[0])
-    all_entries  = []
-    
-    print("Scanning all files...")
-    found = []
-    for root in scan_roots:
-        found.extend(list(Path(root).rglob('*')))
-    files = [f for f in found if f.is_file()]
-    total = len(files)
-    
-    for i, fpath in enumerate(files):
-        # Skip system and SIFT files
-        if fpath.name in {SCRIPT_NAME, 'run_sift.bat', CHECKPOINT_FILE}:
-            continue
-        if any(skip in fpath.parts for skip in SKIP_DIRS):
-            continue
-        if any(part.startswith('SIFT_output_') for part in fpath.parts):
-            continue
+    store_path = output_dir / STORE_FILENAME
+    now        = datetime.datetime.now()
+    cutoff     = now - datetime.timedelta(days=90)
 
-        pct = int((i+1)/total*40)
-        bar = '#'*pct + '-'*(40-pct)
-        print(f"\r[{bar}] {i+1}/{total} {fpath.name[:35]:<35}", end='', flush=True)
+    # Stats accumulators — lightweight
+    total       = 0
+    n_readable  = 0
+    n_binary    = 0
+    n_skipped   = 0
+    lang_counts = {}
+    flagged     = []    # (fpath, [signals]) — only metadata, not content
+    unreadable  = []    # (fpath, ext, size_label, mtime, error)
+    folder_set  = set()
 
-        ext = fpath.suffix.lower()
+    print("Scanning files...")
 
-        if ext in BINARY_EXTENSIONS:
-            all_entries.append((fpath, False, None, 'binary format'))
-            continue
+    with open(store_path, 'w', encoding='utf-8') as store_file:
+        for scan_root in scan_roots:
+            # os.walk is lazy — yields one directory at a time, no full collect
+            for dirpath, dirnames, filenames in os.walk(scan_root):
+                # Prune in place — prevents descending into skipped dirs
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d not in SYSTEM_DIRS
+                    and not d.startswith('SIFT_output_')
+                ]
 
-        content = read_file(fpath)
-        if content is None:
-            all_entries.append((fpath, False, None, 'could not read'))
-        else:
-            content = redact(content)
-            all_entries.append((fpath, True, content, None))
+                for fname in filenames:
+                    if fname in {SCRIPT_NAME, 'run_sift.bat', STORE_FILENAME}:
+                        continue
 
-    print()
-    return all_entries, total
+                    fpath = Path(dirpath) / fname
+                    total += 1
+                    folder_set.add(dirpath)
+
+                    # Progress — every 100 files
+                    if total % 100 == 0:
+                        print(f"\r  {total} files... {fname[:40]:<40}", end='', flush=True)
+
+                    ext = fpath.suffix.lower()
+
+                    # Binary — index metadata only, no content
+                    if ext in BINARY_EXTENSIONS:
+                        n_binary += 1
+                        try:
+                            stat       = fpath.stat()
+                            size_bytes = stat.st_size
+                            mtime      = datetime.datetime.fromtimestamp(stat.st_mtime).strftime('%d %b %Y')
+                            size_label = (f"{size_bytes//1024}kb" if size_bytes >= 1024 else f"{size_bytes}b")
+                        except Exception:
+                            size_label, mtime = 'unknown', 'unknown'
+                        unreadable.append((fpath, ext, size_label, mtime, 'binary format'))
+                        time.sleep(THROTTLE_DELAY)
+                        continue
+
+                    # Skip unknown extensions unless they look like text
+                    if ext not in TEXT_EXTENSIONS and ext != '':
+                        # Try to read anyway — some files have no or unusual extensions
+                        pass
+
+                    # Read content
+                    content = read_file(fpath)
+
+                    if content is None:
+                        n_binary += 1
+                        try:
+                            mtime = datetime.datetime.fromtimestamp(fpath.stat().st_mtime).strftime('%d %b %Y')
+                        except Exception:
+                            mtime = 'unknown'
+                        unreadable.append((fpath, ext, 'unknown', mtime, 'could not read'))
+                        time.sleep(THROTTLE_DELAY)
+                        continue
+
+                    # Readable — redact and write to store immediately
+                    safe_content = redact(content)
+                    n_readable  += 1
+
+                    store_file.write(f"{STORE_MARKER_START}\n")
+                    store_file.write(f"PATH: {fpath}\n")
+                    store_file.write(f"{STORE_MARKER_END_HEADER}\n")
+                    store_file.write(safe_content)
+                    store_file.write(f"\n{STORE_MARKER_END}\n")
+
+                    # Collect stats — no content held in RAM after this point
+                    lang = detect_language(fpath)
+                    if lang != 'Unknown':
+                        lang_counts[lang] = lang_counts.get(lang, 0) + 1
+
+                    try:
+                        mtime_dt = datetime.datetime.fromtimestamp(fpath.stat().st_mtime)
+                        mtime_str = mtime_dt.strftime('%d %b %Y')
+                        recent = mtime_dt > cutoff
+                    except Exception:
+                        mtime_str, recent = 'unknown', False
+
+                    signals = []
+                    todos   = len(re.findall(r'\b(TODO|FIXME|HACK|BUG)\b', content, re.IGNORECASE))
+                    has_keys = bool(re.search(r'(?:api[_-]?key|password|secret|token)', content, re.IGNORECASE))
+                    if todos:
+                        signals.append(f"{todos} TODO/FIXME")
+                    if has_keys:
+                        signals.append("credential patterns")
+                    if recent:
+                        signals.append("modified last 90 days")
+                    if signals:
+                        flagged.append((fpath, signals, mtime_str))
+
+                    # content goes out of scope here — RAM freed
+                    del content, safe_content
+
+                    time.sleep(THROTTLE_DELAY)
+
+    print(f"\r  {total} files scanned.{' '*50}")
+    return total, n_readable, n_binary, lang_counts, flagged, unreadable, list(folder_set)
+
 
 # ── Mode 1: Full scan and index ───────────────────────────────────────────────
 def mode_scan(output_dir, scan_root, plain_english=False):
-    date_str = datetime.datetime.now().strftime('%Y_%m_%d_%H%M')
-    scan_id  = hashlib.md5(f"{platform.node()}{date_str}".encode()).hexdigest()[:12].upper()
-
+    date_str   = datetime.datetime.now().strftime('%Y_%m_%d_%H%M')
+    scan_id    = hashlib.md5(f"{platform.node()}{date_str}".encode()).hexdigest()[:12].upper()
     scan_label = ', '.join(str(r) for r in scan_root) if isinstance(scan_root, list) else str(scan_root)
+    now_str    = datetime.datetime.now().strftime('%d %B %Y %H:%M')
 
-    all_entries, total = walk_and_index(scan_root)
+    total, n_readable, n_binary, lang_counts, flagged, unreadable, folders = \
+        walk_and_index(scan_root, output_dir)
 
-    readable   = [(f,r,c,e) for f,r,c,e in all_entries if r]
-    unreadable = [(f,r,c,e) for f,r,c,e in all_entries if not r]
+    print(f"\nTotal files found:  {total}")
+    print(f"Readable as text:   {n_readable}")
+    print(f"Binary/unreadable:  {n_binary}")
 
-    print(f"\nTotal files found:    {total}")
-    print(f"Readable as text:     {len(readable)}")
-    print(f"Binary/unreadable:    {len(unreadable)}")
-
-    # ── Shared header block ───────────────────────────────────────────────────
-    now_str = datetime.datetime.now().strftime('%d %B %Y %H:%M')
-    cutoff  = datetime.datetime.now() - datetime.timedelta(days=90)
-
-    # Folder structure
-    folders = sorted(set(str(f.parent) for f,r,c,e in all_entries))
-    folder_lines = []
-    for folder in folders:
-        count = sum(1 for f,r,c,e in all_entries if str(f.parent) == folder)
-        folder_lines.append(f"  {folder}  ({count} files)")
-
-    # Technology summary
-    lang_counts = {}
-    for fpath, readable_flag, content, error in all_entries:
-        lang = detect_language(fpath)
-        if lang != 'Unknown':
-            lang_counts[lang] = lang_counts.get(lang, 0) + 1
-
-    # Signals — files with TODOs, sensitive patterns, recently modified
-    flagged = []
-    for fpath, readable_flag, content, error in all_entries:
-        if not readable_flag or not content:
-            continue
-        signals = []
-        todos = len(re.findall(r'\b(TODO|FIXME|HACK|BUG)\b', content, re.IGNORECASE))
-        has_keys = bool(re.search(r'(?:api[_-]?key|password|secret|token)', content, re.IGNORECASE))
-        try:
-            mtime = datetime.datetime.fromtimestamp(fpath.stat().st_mtime)
-            recent = mtime > cutoff
-        except Exception:
-            recent = False
-        if todos > 0:
-            signals.append(f"{todos} TODO/FIXME")
-        if has_keys:
-            signals.append("credential patterns")
-        if recent:
-            signals.append("modified in last 90 days")
-        if signals:
-            flagged.append((fpath, signals))
-
-    # ── BUILD SUMMARY FILE ────────────────────────────────────────────────────
-    summary_lines = []
-    summary_lines.append("=" * 60)
-    summary_lines.append("SIFT v2 INDEX SUMMARY")
-    summary_lines.append("=" * 60)
-    summary_lines.append(f"Scan ID:      {scan_id}")
-    summary_lines.append(f"Date:         {now_str}")
-    summary_lines.append(f"Machine:      {platform.node()}")
-    summary_lines.append(f"OS:           {platform.system()} {platform.release()}")
-    summary_lines.append(f"Scanned:      {scan_label}")
-    summary_lines.append(f"Total files:  {total}")
-    summary_lines.append(f"Readable:     {len(readable)}")
-    summary_lines.append(f"Unreadable:   {len(unreadable)}")
-    summary_lines.append(f"Folders:      {len(folders)}")
-    summary_lines.append("")
-
-    summary_lines.append("TECHNOLOGIES DETECTED:")
+    # ── Summary file ─────────────────────────────────────────────────────────
+    summary_lines = [
+        "=" * 60,
+        "SIFT v2 INDEX SUMMARY",
+        "=" * 60,
+        f"Scan ID:      {scan_id}",
+        f"Date:         {now_str}",
+        f"Machine:      {platform.node()}",
+        f"OS:           {platform.system()} {platform.release()}",
+        f"Scanned:      {scan_label}",
+        f"Total files:  {total}",
+        f"Readable:     {n_readable}",
+        f"Unreadable:   {n_binary}",
+        f"Folders:      {len(folders)}",
+        "",
+        "TECHNOLOGIES DETECTED:",
+    ]
     for lang, count in sorted(lang_counts.items(), key=lambda x: -x[1]):
         summary_lines.append(f"  {lang}: {count} files")
-    summary_lines.append("")
 
-    summary_lines.append("FOLDER STRUCTURE (all folders):")
-    summary_lines.extend(folder_lines)
-    summary_lines.append("")
+    summary_lines += [
+        "",
+        "FOLDER STRUCTURE:",
+    ]
+    for folder in sorted(folders):
+        summary_lines.append(f"  {folder}")
 
-    summary_lines.append("=" * 60)
-    summary_lines.append(f"FLAGGED FILES ({len(flagged)} files with signals)")
-    summary_lines.append("These files have TODOs, credentials, or recent changes.")
-    summary_lines.append("=" * 60)
-    for fpath, signals in flagged:
-        try:
-            mtime = datetime.datetime.fromtimestamp(fpath.stat().st_mtime).strftime('%d %b %Y')
-        except Exception:
-            mtime = 'unknown'
+    summary_lines += [
+        "",
+        "=" * 60,
+        f"FLAGGED FILES ({len(flagged)} files with signals)",
+        "TODOs, credentials, or recent changes.",
+        "=" * 60,
+    ]
+    for fpath, signals, mtime in flagged:
         summary_lines.append(f"\nFILE: {fpath}")
         summary_lines.append(f"SIGNALS: {', '.join(signals)}")
         summary_lines.append(f"MODIFIED: {mtime}")
         summary_lines.append("-" * 50)
 
-    summary_lines.append("")
-    summary_lines.append("=" * 60)
-    summary_lines.append("UNREADABLE FILES (binary/unsupported)")
-    summary_lines.append("These exist but cannot be read as text.")
-    summary_lines.append("=" * 60)
-    for fpath, r, c, error in unreadable:
-        try:
-            size  = fpath.stat().st_size
-            mtime = datetime.datetime.fromtimestamp(fpath.stat().st_mtime).strftime('%d %b %Y')
-            size_label = f"{size//1024}kb" if size >= 1024 else f"{size}b"
-        except Exception:
-            size_label = 'unknown'
-            mtime = 'unknown'
-        summary_lines.append(f"  {fpath}  [{fpath.suffix}]  {size_label}  {mtime}")
+    summary_lines += [
+        "",
+        "=" * 60,
+        "UNREADABLE FILES (binary/unsupported)",
+        "=" * 60,
+    ]
+    for fpath, ext, size_label, mtime, error in unreadable:
+        summary_lines.append(f"  {fpath}  [{ext}]  {size_label}  {mtime}")
 
-    summary_lines.append("")
-    summary_lines.append("NOTE: Full file-by-file index is in SIFT_index_full.txt")
-    summary_lines.append("Request it only if this summary is not enough.")
+    summary_lines += [
+        "",
+        "NOTE: Full file content is in sift_content_store.txt",
+        "SIFT Mode 2 uses this to retrieve specific files on demand.",
+    ]
 
-    summary_text = '\n'.join(summary_lines)
-
-    # Choose prompt language based on user type
+    # Apply builder mode substitutions
     if plain_english:
-        active_prompt = INDEX_PROMPT.replace(
-            "PROJECT TYPE:",
-            "WHAT TYPE OF PROJECT IS THIS:"
-        ).replace(
-            "WHAT IT DOES:",
-            "WHAT DOES IT DO IN PLAIN ENGLISH:"
-        ).replace(
-            "AGE AND ACTIVITY:",
-            "HOW OLD IS IT AND IS IT STILL BEING WORKED ON:"
-        ).replace(
-            "WHAT IS BROKEN OR MISSING:",
-            "WHAT LOOKS BROKEN, UNFINISHED OR MISSING:"
-        ).replace(
-            "FILES I NEED TO READ:",
-            "FILES YOU NEED TO SEE TO FINISH YOUR ANSWER:"
-        ).replace(
-            "WHAT I AM GUESSING:",
-            "WHAT ARE YOU UNSURE ABOUT:"
-        ).replace(
-            "No technical jargon.",
-            ""
-        ) + "
-IMPORTANT: Reply in plain English. No technical jargon. Write as if explaining to someone who has never coded. Avoid terms like codebase, repository, dependencies, or stack.
-"
+        active_prompt = (INDEX_PROMPT
+            .replace("PROJECT TYPE:", "WHAT TYPE OF PROJECT IS THIS:")
+            .replace("WHAT IT DOES:", "WHAT DOES IT DO IN PLAIN ENGLISH:")
+            .replace("AGE AND ACTIVITY:", "HOW OLD IS IT AND IS IT STILL BEING WORKED ON:")
+            .replace("WHAT IS BROKEN OR MISSING:", "WHAT LOOKS BROKEN, UNFINISHED OR MISSING:")
+            .replace("FILES I NEED TO READ:", "FILES YOU NEED TO SEE TO FINISH YOUR ANSWER:")
+            .replace("WHAT I AM GUESSING:", "WHAT ARE YOU UNSURE ABOUT:")
+        ) + "\nIMPORTANT: Reply in plain English. No technical jargon.\n"
     else:
         active_prompt = INDEX_PROMPT
 
     summary_path = output_dir / 'SIFT_index_summary.txt'
     with open(summary_path, 'w', encoding='utf-8') as f:
         f.write(active_prompt)
-        f.write(summary_text)
+        f.write('\n'.join(summary_lines))
 
-    # ── BUILD FULL INDEX FILE ─────────────────────────────────────────────────
-    full_lines = []
-    full_lines.append("=" * 60)
-    full_lines.append("SIFT v2 FULL INDEX")
-    full_lines.append(f"Scan ID: {scan_id}  |  {now_str}")
-    full_lines.append("Every file. Nothing removed.")
-    full_lines.append("=" * 60)
-    full_lines.append("")
-
-    for fpath, readable_flag, content, error in all_entries:
-        full_lines.append(build_index_entry(fpath, readable_flag, content, error))
-
+    # ── Full index file — built from store, not from memory ──────────────────
+    # Read back from store to build the full index — never held in RAM all at once
     full_path = output_dir / 'SIFT_index_full.txt'
-    with open(full_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(full_lines))
+    store_path = output_dir / STORE_FILENAME
+
+    with open(full_path, 'w', encoding='utf-8') as out:
+        out.write("=" * 60 + "\n")
+        out.write("SIFT v2 FULL INDEX\n")
+        out.write(f"Scan ID: {scan_id}  |  {now_str}\n")
+        out.write("Every file. Nothing removed.\n")
+        out.write("=" * 60 + "\n\n")
+
+        # Stream through store, write one entry at a time — no memory spike
+        if store_path.exists():
+            current_path  = None
+            in_content    = False
+            content_lines = []
+
+            with open(store_path, 'r', encoding='utf-8', errors='replace') as store:
+                for line in store:
+                    ls = line.rstrip('\n')
+                    if ls == STORE_MARKER_START:
+                        current_path, in_content, content_lines = None, False, []
+                    elif ls.startswith("PATH: ") and not in_content:
+                        current_path = ls[6:].strip()
+                    elif ls == STORE_MARKER_END_HEADER:
+                        in_content = True
+                    elif ls == STORE_MARKER_END:
+                        if current_path and in_content:
+                            fpath   = Path(current_path)
+                            content = '\n'.join(content_lines)
+                            out.write(build_index_entry(fpath, True, content))
+                            out.write('\n')
+                        current_path, in_content, content_lines = None, False, []
+                    elif in_content:
+                        content_lines.append(ls)
+
+        # Append unreadable files to full index
+        for fpath, ext, size_label, mtime, error in unreadable:
+            out.write(build_index_entry(fpath, False, error=error))
+            out.write('\n')
 
     # ── Ensemble prompt ───────────────────────────────────────────────────────
     ensemble_path = output_dir / 'SIFT_ensemble_prompt.txt'
@@ -478,41 +604,52 @@ IMPORTANT: Reply in plain English. No technical jargon. Write as if explaining t
         f.write("\n--- GEMINI ---\n[paste here]\n")
         f.write("\n--- GROQ ---\n[paste here]\n")
 
-    # ── Content store for mode 2 ──────────────────────────────────────────────
-    content_store = {str(fpath): content for fpath,r,content,e in all_entries if r and content}
-    store_path = output_dir / 'sift_store.pkl'
-    with open(store_path, 'wb') as f:
-        pickle.dump({'scan_id': scan_id, 'scan_root': str(scan_root), 'store': content_store}, f)
-
-    print(f"\nSummary index: SIFT_index_summary.txt  (use this first)")
-    print(f"Full index:    SIFT_index_full.txt     (use only if needed)")
-    print(f"Store:         sift_store.pkl           (used by mode 2)")
-    print(f"Ensemble:      SIFT_ensemble_prompt.txt")
+    print(f"\nSummary:   SIFT_index_summary.txt  ← start here")
+    print(f"Full:      SIFT_index_full.txt     ← only if needed")
+    print(f"Store:     {STORE_FILENAME}  ← used by Mode 2")
+    print(f"Ensemble:  SIFT_ensemble_prompt.txt")
 
     return scan_id, output_dir
 
+
 # ── Mode 2: Retrieve specific files ──────────────────────────────────────────
-def mode_retrieve(output_dir):
-    # Find most recent store
-    stores = sorted(Path('.').glob('SIFT_output_**/sift_store.pkl'))
-    if not stores:
-        stores = sorted(Path(output_dir).glob('sift_store.pkl'))
+def mode_retrieve():
+    """
+    Find the most recent content store and retrieve specific files from it.
+    Searches from SCRIPT_DIR — reliable regardless of where user runs from.
+    """
+    # Search from script directory — not cwd (fixes original bug)
+    stores = sorted(SCRIPT_DIR.glob('SIFT_output_*/' + STORE_FILENAME))
 
     if not stores:
-        print("No previous scan found. Run Mode 1 first.")
+        print("No previous scan found.")
+        print(f"Run Mode 1 first. Output goes to SIFT_output_[date] folder.")
+        print(f"Searched in: {SCRIPT_DIR}")
         return
 
-    store_path = stores[-1]
-    print(f"Loading scan from: {store_path.parent.name}")
+    # Show available scans if more than one
+    if len(stores) > 1:
+        print(f"Found {len(stores)} previous scans:")
+        for i, s in enumerate(stores, 1):
+            print(f"  {i}. {s.parent.name}")
+        choice = input("Which scan? (Enter number, or press Enter for most recent): ").strip()
+        try:
+            idx = int(choice) - 1
+            store_path = stores[idx]
+        except (ValueError, IndexError):
+            store_path = stores[-1]
+    else:
+        store_path = stores[0]
 
-    with open(store_path, 'rb') as f:
-        data = pickle.load(f)
+    print(f"\nUsing scan: {store_path.parent.name}")
 
-    scan_id = data['scan_id']
-    store   = data['store']
-
-    print(f"Scan ID: {scan_id}")
-    print(f"Files available: {len(store)}")
+    # Count available files without loading content
+    file_count = 0
+    with open(store_path, 'r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            if line.startswith("PATH: "):
+                file_count += 1
+    print(f"Files available: {file_count}")
     print()
     print("Paste the file paths the LLM requested.")
     print("One path per line. Press Enter twice when done.")
@@ -520,64 +657,46 @@ def mode_retrieve(output_dir):
 
     lines = []
     while True:
-        line = input()
+        try:
+            line = input()
+        except EOFError:
+            break
         if line == '':
             if lines:
                 break
         else:
             lines.append(line.strip())
 
-    # Clean paths — remove bullet points, dashes, numbers etc
-    requested = []
-    for line in lines:
-        clean = re.sub(r'^[\s\-\*\d\.\)]+', '', line).strip()
-        if clean:
-            requested.append(clean)
+    # Clean paths — strip bullet points, dashes, numbers
+    requested = [
+        re.sub(r'^[\s\-\*\d\.\)]+', '', l).strip()
+        for l in lines if re.sub(r'^[\s\-\*\d\.\)]+', '', l).strip()
+    ]
+
+    if not requested:
+        print("No paths entered.")
+        return
 
     print(f"\nLooking for {len(requested)} files...")
-
-    found     = []
-    not_found = []
-
-    for req in requested:
-        # Try exact match first
-        if req in store:
-            found.append((req, store[req]))
-            continue
-        # Try case-insensitive match
-        req_lower = req.lower()
-        match = next((k for k in store if k.lower() == req_lower), None)
-        if match:
-            found.append((match, store[match]))
-            continue
-        # Try filename only match
-        req_name = Path(req).name.lower()
-        match = next((k for k in store if Path(k).name.lower() == req_name), None)
-        if match:
-            found.append((match, store[match]))
-            continue
-        not_found.append(req)
+    found, not_found = read_from_store(store_path, requested)
 
     print(f"Found: {len(found)} | Not found: {len(not_found)}")
-
     if not_found:
         print("\nCould not find:")
         for nf in not_found:
             print(f"  {nf}")
 
     if not found:
-        print("No files retrieved. Check the paths and try again.")
+        print("No files retrieved. Check paths match exactly what the LLM listed.")
         return
 
-    # Write retrieved content file
-    date_str     = datetime.datetime.now().strftime('%Y_%m_%d_%H%M')
-    retrieve_path = Path(os.path.dirname(os.path.abspath(__file__))) / f"SIFT_retrieved_{date_str}.txt"
+    date_str      = datetime.datetime.now().strftime('%Y_%m_%d_%H%M')
+    retrieve_path = SCRIPT_DIR / f"SIFT_retrieved_{date_str}.txt"
 
     with open(retrieve_path, 'w', encoding='utf-8') as f:
         f.write(CONTENT_PROMPT)
-        f.write(f"Scan ID: {scan_id}\n")
         f.write(f"Files retrieved: {len(found)}\n\n")
-        for fpath, content in found:
+        for fpath, content in found.items():
             f.write(f"\n{'='*50}\n")
             f.write(f"FILE: {fpath}\n")
             f.write(f"{'='*50}\n")
@@ -587,10 +706,11 @@ def mode_retrieve(output_dir):
     print(f"\nRetrieved file saved: {retrieve_path.name}")
     return retrieve_path
 
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     print("=" * 60)
-    print("  SIFT v2 - Find the truth in any codebase")
+    print(f"  SIFT v{VERSION} - Find the truth in any codebase")
     print("  Sifting through shit to get to paradise")
     print("=" * 60)
     print()
@@ -605,8 +725,7 @@ def main():
     mode = input("Enter 1 or 2: ").strip()
 
     if mode == '2':
-        output_dir = Path(os.path.dirname(os.path.abspath(__file__)))
-        retrieve_path = mode_retrieve(output_dir)
+        retrieve_path = mode_retrieve()
         if retrieve_path:
             print()
             print("NEXT STEPS:")
@@ -619,88 +738,101 @@ def main():
         input("Press Enter to close.")
         return
 
-    # Mode 1 — get user type first
+    # Mode 1 — get user type
     print()
     print("Who is using SIFT today?")
     print()
-    print("  1 - Builder or tinkerer (plain English output, no jargon)")
-    print("  2 - Developer or technical professional (full technical detail)")
+    print("  1 - Builder or tinkerer  (plain English, no jargon)")
+    print("  2 - Developer            (full technical detail)")
     print()
-    user_type = input("Enter 1 or 2: ").strip()
+    user_type     = input("Enter 1 or 2: ").strip()
     plain_english = (user_type == "1")
 
     print()
     print("What do you want to scan?")
     print()
-    print("  1 - Whole machine (recommended — finds everything, use on unknown laptops)")
-    print("  2 - Specific folder (if you know where the project lives)")
+    print("  1 - Whole machine  (recommended for unknown laptops)")
+    print("  2 - Specific folder")
     print()
     scan_choice = input("Enter 1 or 2: ").strip()
 
     if scan_choice == '1':
-        # Detect all drives on Windows, or use root on Mac/Linux
         if platform.system() == 'Windows':
             import string
-            drives = [f"{d}:\\" for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
+            drives    = [f"{d}:\\" for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
+            scan_root = drives
             print(f"\nDrives found: {', '.join(drives)}")
-            scan_root = drives  # list of roots
         else:
             scan_root = ['/']
-        print("Scanning whole machine. This may take several minutes on large drives.")
+        print("Scanning whole machine. May take several minutes on large drives.")
     else:
-        scan_root_input = input("\nFolder to scan: ").strip()
-        if not scan_root_input:
-            print("No folder entered. Cancelled.")
+        path_input = input("\nFolder to scan: ").strip()
+        if not path_input or not os.path.exists(path_input):
+            print(f"Path not found: {path_input}")
             sys.exit(1)
-        if not os.path.exists(scan_root_input):
-            print(f"Path not found: {scan_root_input}")
-            sys.exit(1)
-        scan_root = [scan_root_input]
+        scan_root = [path_input]
 
-    # Final warning — all choices made, last chance to cancel
+    # Final confirmation
     print()
     print("=" * 50)
     print("READY TO SCAN")
     print("=" * 50)
-    if isinstance(scan_root, list):
-        print(f"Scanning:  All drives ({', '.join(str(r) for r in scan_root)})")
-    else:
-        print(f"Scanning:  {scan_root[0]}")
-    print(f"User type: {'Builder / plain English output' if plain_english else 'Developer / technical output'}")
+    print(f"Scanning:  {', '.join(str(r) for r in scan_root)}")
+    print(f"Output:    {'Plain English' if plain_english else 'Technical'}")
     print()
-    print("This script will read all text files in the scanned location.")
+    print("This script reads all text files in the scanned location.")
     print("Sensitive data is redacted before anything is written.")
     print("Nothing on the laptop will be changed or deleted.")
     print()
-    go = input("Start scan? (Y/N): ").strip().upper()
-    if go != 'Y':
+    if input("Start scan? (Y/N): ").strip().upper() != 'Y':
         print("Scan cancelled.")
         sys.exit(0)
 
     date_str   = datetime.datetime.now().strftime('%Y_%m_%d_%H%M')
-    output_dir = Path(os.path.dirname(os.path.abspath(__file__))) / f"SIFT_output_{date_str}"
+    output_dir = SCRIPT_DIR / f"SIFT_output_{date_str}"
     output_dir.mkdir(exist_ok=True)
     print(f"\nOutput folder: {output_dir}\n")
 
     scan_id, output_dir = mode_scan(output_dir, scan_root, plain_english)
 
-    # Zip output
+    # Zip output — uses pyzipper for real AES encryption if available
     print()
     zip_password = input("Password to protect output zip (or Enter to skip): ").strip()
-    zip_path = output_dir.parent / f"SIFT_output_{date_str}.zip"
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+    zip_path = SCRIPT_DIR / f"SIFT_output_{date_str}.zip"
+
+    try:
+        import pyzipper
+        with pyzipper.AESZipFile(zip_path, 'w',
+                                  compression=pyzipper.ZIP_DEFLATED,
+                                  encryption=pyzipper.WZ_AES if zip_password else None) as zf:
+            if zip_password:
+                zf.setpassword(zip_password.encode())
+            for f in output_dir.iterdir():
+                if f.name != STORE_FILENAME:
+                    zf.write(f, f.name)
         if zip_password:
-            zf.setpassword(zip_password.encode())
-        for f in output_dir.iterdir():
-            if f.name != 'sift_store.pkl':
-                zf.write(f, f.name)
+            print(f"Encrypted zip saved: {zip_path.name}")
+            print("IMPORTANT: SIFT does not store your password. Do not lose it.")
+        else:
+            print(f"Zip saved (no password): {zip_path.name}")
+    except ImportError:
+        # pyzipper not installed — use standard zip (no encryption)
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for f in output_dir.iterdir():
+                if f.name != STORE_FILENAME:
+                    zf.write(f, f.name)
+        if zip_password:
+            print("Note: pyzipper not installed — zip saved WITHOUT encryption.")
+            print("Run: pip install pyzipper — then re-run SIFT to get encrypted output.")
+        else:
+            print(f"Zip saved: {zip_path.name}")
 
     print()
     print("=" * 60)
     print("SIFT SCAN COMPLETE")
     print("=" * 60)
-    print(f"Scan ID:  {scan_id}")
-    print(f"Output:   {output_dir}")
+    print(f"Scan ID: {scan_id}")
+    print(f"Output:  {output_dir}")
     print()
     print("NEXT STEPS:")
     print("1. Open SIFT_index_summary.txt — start here")
@@ -710,11 +842,11 @@ def main():
     print("5. Upload SIFT_retrieved file back to same LLM conversation")
     print("6. Repeat steps 2-5 for GPT, Gemini, Groq independently")
     print("7. Use SIFT_ensemble_prompt.txt to compare all results")
-    print("8. If LLM needs more depth — upload SIFT_index_full.txt")
     print()
-    print(f"Email {zip_path} to yourself NOW")
+    print(f"Email {zip_path.name} to yourself NOW")
     print()
     input("Press Enter to close.")
+
 
 if __name__ == '__main__':
     main()
