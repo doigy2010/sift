@@ -582,6 +582,36 @@ RAISED: June 2026
 
 ---
 
+Q: What triggers a Heartbeat rescan — manual, scheduled, or file change threshold?
+STATUS: Open
+RAISED: June 2026
+
+---
+
+Q: What is the token cap on the readback screen to keep cost predictable?
+STATUS: Open
+RAISED: June 2026
+
+---
+
+Q: What batching rules apply to Heartbeat mode — hourly, nightly, or on X file changes?
+STATUS: Open
+RAISED: June 2026
+
+---
+
+Q: Does Archive physically move files or mark them?
+STATUS: Open
+RAISED: June 2026
+
+---
+
+Q: Does SIFT work on mobile — single column layout, 48px minimum buttons?
+STATUS: Open
+RAISED: June 2026
+
+---
+
 *Last updated: June 2026*
 *This file is never finished. Every new question is progress.*
 *The questions are the product.*
