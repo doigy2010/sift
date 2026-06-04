@@ -2,7 +2,7 @@ import os, sys, re, time, json, platform, zipfile, hashlib, datetime, mimetypes
 from pathlib import Path
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION = "2.3"
+VERSION = "2.4"
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 SCRIPT_NAME     = os.path.basename(__file__)
@@ -696,6 +696,27 @@ def mode_scan(output_dir, scan_root, plain_english=False):
     print(f"Ensemble:  SIFT_ensemble_prompt.txt")
 
     generate_machine_context(scan_id, scan_root, total, n_readable, folders)
+
+    # ── Connection mapping ────────────────────────────────────────────────────
+    print("\nBuilding connection map...")
+    scanned_file_list = []
+    if store_path.exists():
+        with open(store_path, 'r', encoding='utf-8', errors='replace') as _sf:
+            for _line in _sf:
+                if _line.startswith("PATH: "):
+                    scanned_file_list.append(_line[6:].strip())
+
+    connection_map = build_connection_map(scanned_file_list, store_path)
+    cluster_map    = detect_clusters(connection_map, output_dir)
+    entry_points   = find_entry_points(cluster_map, connection_map)
+
+    entry_path = output_dir / 'SIFT_entry_points.json'
+    with open(entry_path, 'w', encoding='utf-8') as f:
+        json.dump(entry_points, f, indent=2)
+
+    print(f"Clusters:      SIFT_clusters.json     ({len(cluster_map)} clusters)")
+    print(f"Entry points:  SIFT_entry_points.json  ({len(entry_points)} found)")
+
     return scan_id, output_dir
 
 
@@ -839,6 +860,173 @@ def generate_machine_context(scan_id, scan_root, total, n_readable, folders):
         f.write('\n')
 
     print(f"Machine context: MACHINE_CONTEXT.md")
+
+
+# ── Connection mapping ────────────────────────────────────────────────────────
+def build_connection_map(scanned_files, store_path):
+    """
+    Streams through the content store. For each readable file, searches
+    its content for the filenames of all other scanned files (filename only,
+    not full path). Records how many times each filename appears.
+    Returns {filepath_str: {other_filepath_str: mention_count}}
+    """
+    store_path = Path(store_path)
+
+    # filename (lowercase) -> full path string
+    name_to_path = {}
+    for fp in scanned_files:
+        fname = Path(fp).name.lower()
+        if fname not in name_to_path:
+            name_to_path[fname] = fp
+
+    name_set = set(name_to_path.keys())
+
+    # Pre-compile a targeted regex for no-extension filenames (Dockerfile, Makefile, etc.)
+    # Built once here — avoids re-compiling inside the per-file loop
+    no_ext_names = [n for n in name_set if '.' not in n]
+    no_ext_re = (
+        re.compile(r'\b(' + '|'.join(re.escape(n) for n in no_ext_names) + r')\b')
+        if no_ext_names else None
+    )
+
+    connection_map = {fp: {} for fp in scanned_files}
+
+    if not store_path.exists():
+        return connection_map
+
+    current_path  = None
+    in_content    = False
+    content_lines = []
+
+    with open(store_path, 'r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            ls = line.rstrip('\n')
+
+            if ls == STORE_MARKER_START:
+                current_path, in_content, content_lines = None, False, []
+
+            elif ls.startswith("PATH: ") and not in_content:
+                current_path = ls[6:].strip()
+
+            elif ls == STORE_MARKER_END_HEADER:
+                in_content = True
+
+            elif ls == STORE_MARKER_END:
+                if current_path and in_content and current_path in connection_map:
+                    content_lower = '\n'.join(content_lines).lower()
+                    counts = {}
+
+                    # One pass: find filename-like tokens — covers all files with extensions
+                    for c in re.findall(r'[\w.-]+\.[a-zA-Z0-9]{1,10}', content_lower):
+                        if c in name_set and name_to_path[c] != current_path:
+                            counts[c] = counts.get(c, 0) + 1
+
+                    # Second pass: targeted scan for no-extension filenames only
+                    if no_ext_re:
+                        for m in no_ext_re.finditer(content_lower):
+                            fname = m.group(1)
+                            if name_to_path[fname] != current_path:
+                                counts[fname] = counts.get(fname, 0) + 1
+
+                    for fname, count in counts.items():
+                        connection_map[current_path][name_to_path[fname]] = count
+
+                current_path, in_content, content_lines = None, False, []
+
+            elif in_content:
+                content_lines.append(ls)
+
+    return connection_map
+
+
+def detect_clusters(connection_map, output_dir):
+    """
+    Groups files with mutual connections into clusters.
+    Mutual = file A references file B AND file B references file A.
+    A cluster requires 2 or more mutually connected files.
+    Files with no mutual connections are orphans.
+    Writes SIFT_clusters.json to output_dir.
+    Returns {cluster_id: [filepath, ...]}
+    """
+    parent = {}
+
+    def find(x):
+        if x not in parent:
+            parent[x] = x
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x, y):
+        px, py = find(x), find(y)
+        if px != py:
+            parent[px] = py
+
+    for path_a, targets in connection_map.items():
+        for path_b in targets:
+            if path_b in connection_map and path_a in connection_map[path_b]:
+                union(path_a, path_b)
+
+    # Group paths by their union-find root
+    groups = {}
+    for path in connection_map:
+        root = find(path) if path in parent else path
+        groups.setdefault(root, []).append(path)
+
+    cluster_map = {}
+    orphans     = []
+    cluster_idx = 0
+
+    for root, members in groups.items():
+        if len(members) >= 2:
+            cid = f"cluster_{cluster_idx:03d}"
+            cluster_map[cid] = members
+            cluster_idx += 1
+        else:
+            orphans.extend(members)
+
+    result = {
+        "clusters":      cluster_map,
+        "orphans":       orphans,
+        "cluster_count": len(cluster_map),
+        "orphan_count":  len(orphans),
+    }
+
+    out_path = Path(output_dir) / 'SIFT_clusters.json'
+    with open(out_path, 'w', encoding='utf-8') as f:
+        json.dump(result, f, indent=2)
+
+    return cluster_map
+
+
+def find_entry_points(cluster_map, connection_map):
+    """
+    Within each cluster, finds files that are referenced by other cluster
+    members but do not reference back to any of them.
+    Returns list of {"cluster_id": ..., "entry_point": ...}
+    """
+    # Reverse index: which source files point at each target file
+    referenced_by = {}
+    for source, targets in connection_map.items():
+        for target in targets:
+            referenced_by.setdefault(target, [])
+            referenced_by[target].append(source)
+
+    entry_points = []
+
+    for cluster_id, members in cluster_map.items():
+        member_set = set(members)
+        for filepath in members:
+            inbound  = set(referenced_by.get(filepath, [])) & member_set
+            outbound = set(connection_map.get(filepath, {}).keys()) & member_set
+            if inbound and not outbound:
+                entry_points.append({
+                    "cluster_id":  cluster_id,
+                    "entry_point": filepath,
+                })
+
+    return entry_points
 
 
 # ── Mode 2: Retrieve specific files ──────────────────────────────────────────
