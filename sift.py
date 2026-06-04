@@ -1,8 +1,8 @@
-import os, sys, re, time, platform, zipfile, hashlib, datetime, mimetypes
+import os, sys, re, time, json, platform, zipfile, hashlib, datetime, mimetypes
 from pathlib import Path
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION = "2.2"
+VERSION = "2.3"
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 SCRIPT_NAME     = os.path.basename(__file__)
@@ -47,6 +47,19 @@ SYSTEM_DIRS = {
     'dist','build','.idea','.vscode','.next','.cache',
     '.pytest_cache','.mypy_cache',
     'Adobe','.tmp.driveupload','.tmp.drivedownload',
+}
+
+# Pass 2 filter — parent folder names excluded from content scan
+SKIP_DIRS = {
+    '.obsidian',
+    '.claude',
+    'worktrees',
+    '.trash',
+    '.sync',
+    'plugins',
+    'node_modules',
+    '__pycache__',
+    '.git',
 }
 
 
@@ -340,6 +353,77 @@ def read_from_store(store_path, requested_paths):
     return found, not_found
 
 
+# ── Pass 1: metadata collection ───────────────────────────────────────────────
+def collect_metadata(scan_roots, output_dir):
+    """Walk all files using os.scandir. Collect metadata only — no file opens.
+    Writes one JSON record per line to SIFT_metadata.json. Returns total file count."""
+    if isinstance(scan_roots, str):
+        scan_roots = [scan_roots]
+
+    meta_path = output_dir / 'SIFT_metadata.json'
+    total = 0
+
+    with open(meta_path, 'w', encoding='utf-8') as meta_file:
+        for scan_root in scan_roots:
+            dirs_to_visit = [Path(scan_root)]
+            while dirs_to_visit:
+                current_dir = dirs_to_visit.pop()
+                try:
+                    entries = list(os.scandir(current_dir))
+                except Exception:
+                    continue
+                for entry in entries:
+                    if entry.is_dir(follow_symlinks=False):
+                        if (entry.name not in SYSTEM_DIRS
+                                and not entry.name.startswith('SIFT_output_')):
+                            dirs_to_visit.append(Path(entry.path))
+                    elif entry.is_file(follow_symlinks=False):
+                        try:
+                            stat = entry.stat()
+                            record = {
+                                'path':   entry.path,
+                                'size':   stat.st_size,
+                                'mtime':  stat.st_mtime,
+                                'ext':    Path(entry.name).suffix.lower(),
+                                'parent': Path(entry.path).parent.name,
+                            }
+                            meta_file.write(json.dumps(record) + '\n')
+                            total += 1
+                            if total % 1000 == 0:
+                                print(f"  Pass 1: {total} files found...")
+                        except Exception:
+                            continue
+
+    return total
+
+
+# ── Pass 2: filter metadata to scan targets ────────────────────────────────────
+def filter_for_scan(output_dir):
+    """Read SIFT_metadata.json. Return list of paths passing all three rules:
+    extension in TEXT_EXTENSIONS, size 100–5000000 bytes, parent not in SKIP_DIRS."""
+    meta_path = output_dir / 'SIFT_metadata.json'
+    selected = []
+
+    with open(meta_path, 'r', encoding='utf-8') as meta_file:
+        for line in meta_file:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except Exception:
+                continue
+            if record['ext'] not in TEXT_EXTENSIONS:
+                continue
+            if not (100 <= record['size'] <= 5000000):
+                continue
+            if record['parent'] in SKIP_DIRS:
+                continue
+            selected.append(record['path'])
+
+    return selected
+
+
 # ── Walk and index — streaming, throttled ─────────────────────────────────────
 def walk_and_index(scan_roots, output_dir):
     """
@@ -354,7 +438,6 @@ def walk_and_index(scan_roots, output_dir):
     cutoff     = now - datetime.timedelta(days=90)
 
     # Stats accumulators — lightweight
-    total       = 0
     n_readable  = 0
     n_binary    = 0
     n_skipped   = 0
@@ -363,105 +446,108 @@ def walk_and_index(scan_roots, output_dir):
     unreadable  = []    # (fpath, ext, size_label, mtime, error)
     folder_set  = set()
 
+    total = collect_metadata(scan_roots, output_dir)
+    print(f"Pass 1 complete: {total} files found")
+
+    target_files = filter_for_scan(output_dir)
+    print(f"Pass 2 scanning: {len(target_files)} files selected")
+
+    meta_path = output_dir / 'SIFT_metadata.json'
+    if meta_path.exists():
+        meta_path.unlink()
+
     print("Scanning files...")
+    scan_count = 0
 
     with open(store_path, 'w', encoding='utf-8') as store_file:
-        for scan_root in scan_roots:
-            # os.walk is lazy — yields one directory at a time, no full collect
-            for dirpath, dirnames, filenames in os.walk(scan_root):
-                # Prune in place — prevents descending into skipped dirs
-                dirnames[:] = [
-                    d for d in dirnames
-                    if d not in SYSTEM_DIRS
-                    and not d.startswith('SIFT_output_')
-                ]
+        for file_path_str in target_files:
+            fpath = Path(file_path_str)
+            fname = fpath.name
 
-                for fname in filenames:
-                    if fname in {SCRIPT_NAME, 'run_sift.bat', STORE_FILENAME}:
-                        continue
+            if fname in {SCRIPT_NAME, 'run_sift.bat', STORE_FILENAME}:
+                continue
 
-                    fpath = Path(dirpath) / fname
-                    total += 1
-                    folder_set.add(dirpath)
+            folder_set.add(str(fpath.parent))
+            scan_count += 1
 
-                    # Progress — every 100 files
-                    if total % 100 == 0:
-                        print(f"\r  {total} files... {fname[:40]:<40}", end='', flush=True)
+            # Progress — every 100 files
+            if scan_count % 100 == 0:
+                print(f"\r  {scan_count} files... {fname[:40]:<40}", end='', flush=True)
 
-                    ext = fpath.suffix.lower()
+            ext = fpath.suffix.lower()
 
-                    # Binary — index metadata only, no content
-                    if ext in BINARY_EXTENSIONS:
-                        n_binary += 1
-                        try:
-                            stat       = fpath.stat()
-                            size_bytes = stat.st_size
-                            mtime      = datetime.datetime.fromtimestamp(stat.st_mtime).strftime('%d %b %Y')
-                            size_label = (f"{size_bytes//1024}kb" if size_bytes >= 1024 else f"{size_bytes}b")
-                        except Exception:
-                            size_label, mtime = 'unknown', 'unknown'
-                        unreadable.append((fpath, ext, size_label, mtime, 'binary format'))
-                        time.sleep(THROTTLE_DELAY)
-                        continue
+            # Binary — index metadata only, no content
+            if ext in BINARY_EXTENSIONS:
+                n_binary += 1
+                try:
+                    stat       = fpath.stat()
+                    size_bytes = stat.st_size
+                    mtime      = datetime.datetime.fromtimestamp(stat.st_mtime).strftime('%d %b %Y')
+                    size_label = (f"{size_bytes//1024}kb" if size_bytes >= 1024 else f"{size_bytes}b")
+                except Exception:
+                    size_label, mtime = 'unknown', 'unknown'
+                unreadable.append((fpath, ext, size_label, mtime, 'binary format'))
+                time.sleep(THROTTLE_DELAY)
+                continue
 
-                    # Skip unknown extensions unless they look like text
-                    if ext not in TEXT_EXTENSIONS and ext != '':
-                        # Try to read anyway — some files have no or unusual extensions
-                        pass
+            # Skip unknown extensions unless they look like text
+            if ext not in TEXT_EXTENSIONS and ext != '':
+                # Try to read anyway — some files have no or unusual extensions
+                pass
 
-                    # Read content
-                    content = read_file(fpath)
+            # Read content
+            content = read_file(fpath)
 
-                    if content is None:
-                        n_binary += 1
-                        try:
-                            mtime = datetime.datetime.fromtimestamp(fpath.stat().st_mtime).strftime('%d %b %Y')
-                        except Exception:
-                            mtime = 'unknown'
-                        unreadable.append((fpath, ext, 'unknown', mtime, 'could not read'))
-                        time.sleep(THROTTLE_DELAY)
-                        continue
+            if content is None:
+                n_binary += 1
+                try:
+                    mtime = datetime.datetime.fromtimestamp(fpath.stat().st_mtime).strftime('%d %b %Y')
+                except Exception:
+                    mtime = 'unknown'
+                unreadable.append((fpath, ext, 'unknown', mtime, 'could not read'))
+                time.sleep(THROTTLE_DELAY)
+                continue
 
-                    # Readable — redact and write to store immediately
-                    safe_content = redact(content)
-                    n_readable  += 1
+            # Readable — redact and write to store immediately
+            safe_content = redact(content)
+            n_readable  += 1
 
-                    store_file.write(f"{STORE_MARKER_START}\n")
-                    store_file.write(f"PATH: {fpath}\n")
-                    store_file.write(f"{STORE_MARKER_END_HEADER}\n")
-                    store_file.write(safe_content)
-                    store_file.write(f"\n{STORE_MARKER_END}\n")
+            store_file.write(f"{STORE_MARKER_START}\n")
+            store_file.write(f"PATH: {fpath}\n")
+            store_file.write(f"{STORE_MARKER_END_HEADER}\n")
+            store_file.write(safe_content)
+            store_file.write(f"\n{STORE_MARKER_END}\n")
 
-                    # Collect stats — no content held in RAM after this point
-                    lang = detect_language(fpath)
-                    if lang != 'Unknown':
-                        lang_counts[lang] = lang_counts.get(lang, 0) + 1
+            # Collect stats — no content held in RAM after this point
+            lang = detect_language(fpath)
+            if lang != 'Unknown':
+                lang_counts[lang] = lang_counts.get(lang, 0) + 1
 
-                    try:
-                        mtime_dt = datetime.datetime.fromtimestamp(fpath.stat().st_mtime)
-                        mtime_str = mtime_dt.strftime('%d %b %Y')
-                        recent = mtime_dt > cutoff
-                    except Exception:
-                        mtime_str, recent = 'unknown', False
+            try:
+                mtime_dt = datetime.datetime.fromtimestamp(fpath.stat().st_mtime)
+                mtime_str = mtime_dt.strftime('%d %b %Y')
+                recent = mtime_dt > cutoff
+            except Exception:
+                mtime_str, recent = 'unknown', False
 
-                    signals = []
-                    todos   = len(re.findall(r'\b(TODO|FIXME|HACK|BUG)\b', content, re.IGNORECASE))
-                    has_keys = bool(re.search(r'(?:api[_-]?key|password|secret|token)', content, re.IGNORECASE))
-                    if todos:
-                        signals.append(f"{todos} TODO/FIXME")
-                    if has_keys:
-                        signals.append("credential patterns")
-                    if recent:
-                        signals.append("modified last 90 days")
-                    if signals:
-                        flagged.append((fpath, signals, mtime_str))
+            signals = []
+            todos   = len(re.findall(r'\b(TODO|FIXME|HACK|BUG)\b', content, re.IGNORECASE))
+            has_keys = bool(re.search(r'(?:api[_-]?key|password|secret|token)', content, re.IGNORECASE))
+            if todos:
+                signals.append(f"{todos} TODO/FIXME")
+            if has_keys:
+                signals.append("credential patterns")
+            if recent:
+                signals.append("modified last 90 days")
+            if signals:
+                flagged.append((fpath, signals, mtime_str))
 
-                    # content goes out of scope here — RAM freed
-                    del content, safe_content
+            # content goes out of scope here — RAM freed
+            del content, safe_content
 
-                    time.sleep(THROTTLE_DELAY)
+            time.sleep(THROTTLE_DELAY)
 
-    print(f"\r  {total} files scanned.{' '*50}")
+    print(f"\r  {scan_count} files scanned.{' '*50}")
     return total, n_readable, n_binary, lang_counts, flagged, unreadable, list(folder_set)
 
 
@@ -609,7 +695,150 @@ def mode_scan(output_dir, scan_root, plain_english=False):
     print(f"Store:     {STORE_FILENAME}  ← used by Mode 2")
     print(f"Ensemble:  SIFT_ensemble_prompt.txt")
 
+    generate_machine_context(scan_id, scan_root, total, n_readable, folders)
     return scan_id, output_dir
+
+
+# ── Machine context generator ─────────────────────────────────────────────────
+def generate_machine_context(scan_id, scan_root, total, n_readable, folders):
+    import json as _json
+    import socket as _socket
+    import subprocess as _subprocess
+
+    output_path = SCRIPT_DIR / 'MACHINE_CONTEXT.md'
+    now = datetime.datetime.now()
+    out = []
+
+    # SECTION 1 — PYTHON ENVIRONMENT
+    out.append("PYTHON ENVIRONMENT")
+    out.append("Python version: " + sys.version.replace("\n", " "))
+    out.append("")
+    out.append("Installed packages:")
+    try:
+        proc = _subprocess.run(
+            ['pip', 'list', '--format=json'],
+            capture_output=True, text=True, timeout=30
+        )
+        if proc.returncode == 0:
+            pkgs = _json.loads(proc.stdout)
+            for p in sorted(pkgs, key=lambda x: x['name'].lower()):
+                out.append(p['name'] + ": " + p['version'])
+        else:
+            out.append("pip list failed: " + proc.stderr.strip())
+    except Exception as e:
+        out.append("Could not retrieve package list: " + str(e))
+
+    out.append("")
+
+    # SECTION 2 — MACHINE
+    out.append("MACHINE")
+    out.append("Machine name: " + platform.node())
+    out.append("OS: " + platform.system())
+    out.append("OS version: " + platform.release())
+    out.append("Generated: " + now.strftime('%d %B %Y %H:%M'))
+
+    out.append("")
+
+    # Compute top-level folder stats — used in sections 3 and 5
+    scan_roots = scan_root if isinstance(scan_root, list) else [scan_root]
+    cluster_data = []
+    for root in scan_roots:
+        root_path = Path(str(root))
+        try:
+            entries = sorted(root_path.iterdir(), key=lambda x: x.name.lower())
+        except Exception:
+            entries = []
+        for item in entries:
+            if not item.is_dir():
+                continue
+            if item.name in SYSTEM_DIRS or item.name.startswith('SIFT_output_'):
+                continue
+            file_count = 0
+            ext_counts = {}
+            last_mod = None
+            try:
+                for dp, dns, fns in os.walk(str(item)):
+                    dns[:] = [
+                        d for d in dns
+                        if d not in SYSTEM_DIRS and not d.startswith('SIFT_output_')
+                    ]
+                    for fn in fns:
+                        fp = Path(dp) / fn
+                        file_count += 1
+                        ext = fp.suffix.lower()
+                        if ext:
+                            ext_counts[ext] = ext_counts.get(ext, 0) + 1
+                        try:
+                            mt = fp.stat().st_mtime
+                            if last_mod is None or mt > last_mod:
+                                last_mod = mt
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            primary_ext = max(ext_counts, key=ext_counts.get) if ext_counts else 'none'
+            last_mod_str = (
+                datetime.datetime.fromtimestamp(last_mod).strftime('%d %b %Y')
+                if last_mod else 'unknown'
+            )
+            cluster_data.append({
+                'name': item.name,
+                'path': str(item),
+                'file_count': file_count,
+                'primary_ext': primary_ext,
+                'last_modified': last_mod_str,
+            })
+
+    # SECTION 3 — ACTIVE PROJECTS
+    out.append("ACTIVE PROJECTS")
+    if cluster_data:
+        for c in cluster_data:
+            out.append("Folder: " + c['name'])
+            out.append("Path: " + c['path'])
+            out.append("Files: " + str(c['file_count']))
+            out.append("Primary extension: " + c['primary_ext'])
+            out.append("Last modified: " + c['last_modified'])
+            out.append("")
+    else:
+        out.append("No top-level folders found in scan root")
+        out.append("")
+
+    # SECTION 4 — PORT CHECK
+    out.append("PORT CHECK")
+    PORTS_TO_CHECK = [8080, 8088, 3000, 5000, 8000, 8001, 6006, 11434]
+    for port in PORTS_TO_CHECK:
+        try:
+            sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            sock.settimeout(0.5)
+            res = sock.connect_ex(('127.0.0.1', port))
+            sock.close()
+            status = "IN USE" if res == 0 else "FREE"
+        except Exception:
+            status = "FREE"
+        out.append("PORT " + str(port) + " — " + status)
+
+    out.append("")
+
+    # SECTION 5 — FOLDER MAP
+    out.append("FOLDER MAP")
+    for c in sorted(cluster_data, key=lambda x: -x['file_count']):
+        out.append(c['name'] + " — " + str(c['file_count']))
+
+    out.append("")
+
+    # SECTION 6 — SIFT SCAN REFERENCE
+    out.append("SIFT SCAN REFERENCE")
+    out.append("Scan ID: " + scan_id)
+    out.append("Date: " + now.strftime('%d %B %Y %H:%M'))
+    out.append("Scanned: " + ', '.join(str(r) for r in scan_roots))
+    out.append("Total files found: " + str(total))
+    out.append("Readable files: " + str(n_readable))
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(out))
+        f.write('\n')
+
+    print(f"Machine context: MACHINE_CONTEXT.md")
 
 
 # ── Mode 2: Retrieve specific files ──────────────────────────────────────────
