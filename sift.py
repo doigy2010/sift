@@ -1224,10 +1224,25 @@ def main():
             scan_root = ['/']
         print("Scanning whole machine. May take several minutes on large drives.")
     else:
-        path_input = input("\nFolder to scan: ").strip()
+        # Try tkinter folder picker popup; fall back to text input if unavailable
+        path_input = None
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            _root = tk.Tk()
+            _root.withdraw()
+            _root.attributes('-topmost', True)
+            path_input = filedialog.askdirectory(title='Choose a folder to scan')
+            _root.destroy()
+        except Exception:
+            pass
+        if not path_input:
+            # Fallback: tkinter unavailable or user cancelled the dialog
+            path_input = input("\nFolder to scan (type the path): ").strip()
         if not path_input or not os.path.exists(path_input):
             print(f"Path not found: {path_input}")
             sys.exit(1)
+        print(f"\nFolder selected: {path_input}")
         scan_root = [path_input]
 
     # Final confirmation
