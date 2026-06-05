@@ -4,6 +4,21 @@ from pathlib import Path
 SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 MIN_CLUSTER_FILES = 2
 
+# Folders that are software installations — not user work.
+# Skipped entirely when building clusters.
+# Files inside are dropped — not moved to loose files.
+SKIP_CLUSTER_FOLDERS = {
+    'Microsoft VS Code',
+    'Smart File Tagger',
+    '.vscode',
+    'extensions',
+    'node_modules',
+    'resources',
+    'AppData',
+    'Local',
+    'Roaming',
+}
+
 VERSION_SUFFIX_RE = re.compile(
     r'[-_\s]*(v\d+|version\d+|final|backup|old|new|copy|\d+|revised|updated|archive|bak)\s*$',
     re.IGNORECASE
@@ -144,6 +159,11 @@ def build_clusters(output_dir):
             loose_raw.append(f)
         else:
             cluster_files[root].append(f)
+
+    # Drop software installation folders entirely — not user work, not loose files
+    for folder in list(cluster_files.keys()):
+        if Path(folder).name in SKIP_CLUSTER_FOLDERS:
+            cluster_files.pop(folder)
 
     for folder in list(cluster_files.keys()):
         if len(cluster_files[folder]) < MIN_CLUSTER_FILES:

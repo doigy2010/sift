@@ -1,10 +1,12 @@
-import os, sys, json, datetime
+import os, sys, json, datetime, tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+from sift import time_estimate, collect_metadata, filter_for_scan
 from build_clusters import (
     relative_time, folder_name_to_plain_english, parse_index_full,
     find_scan_roots, get_cluster_root, detect_version_groups, build_clusters,
+    SKIP_CLUSTER_FOLDERS,
 )
 from build_entry_points import (
     find_entry_point, count_missing_local_imports,
@@ -13,6 +15,8 @@ from build_entry_points import (
 )
 from sift_report import (
     load_report_data, render_opening_page, render_no_scan_page,
+    count_by_group, derive_description,
+    render_group_selection,
     build_review_queue, get_current_card,
     load_decisions, save_decision,
     render_card, render_loose_file_card,
@@ -20,6 +24,8 @@ from sift_report import (
     build_readback_prompt, call_groq, call_openrouter, call_ollama,
     python_fallback_summary, generate_readback,
     find_start_with, render_readback_consent, render_readback_result,
+    auto_save_report,
+    _BASE_CSS,
 )
 
 TEST_DIR  = Path(__file__).parent / 'test_fake_output'
@@ -61,9 +67,9 @@ def make_fake_index_full():
         # my-website: 2 files.
         (r'C:\fake_scan\my-website\index.html', '01 Jan 2025 10:00'),
         (r'C:\fake_scan\my-website\style.css',  '01 Jan 2025 10:00'),
-        # lonely.py: directly in scan root → loose file.
+        # lonely.py: directly in scan root -> loose file.
         (r'C:\fake_scan\lonely.py', '01 Jan 2025 10:00'),
-        # solo: 1 file only → below MIN_CLUSTER_FILES → loose.
+        # solo: 1 file only -> below MIN_CLUSTER_FILES -> loose.
         (r'C:\fake_scan\solo\script.py', '01 Jan 2025 10:00'),
     ]
     for path, modified in entries:
@@ -214,6 +220,149 @@ def test_build_clusters_end_to_end():
         check('generated key present',   'generated'   in loaded)
 
 
+def make_fake_index_with_vscode():
+    """
+    Index that includes files under 'Microsoft VS Code' and 'node_modules'.
+    These must NOT appear as clusters or loose files in output.
+    Also includes a normal user project to confirm it still appears.
+    """
+    lines = [
+        '=' * 60, 'SIFT v2 FULL INDEX', '=' * 60, '',
+    ]
+    entries = [
+        # Real user project — must become a cluster
+        (r'C:\fake_scan\my-project\main.py',   '01 Jan 2026 10:00'),
+        (r'C:\fake_scan\my-project\utils.py',  '01 Jan 2026 10:00'),
+        # Software installation — must be skipped entirely
+        (r'C:\fake_scan\Microsoft VS Code\app.py',    '01 Jan 2026 10:00'),
+        (r'C:\fake_scan\Microsoft VS Code\main.py',   '01 Jan 2026 10:00'),
+        (r'C:\fake_scan\Microsoft VS Code\utils.py',  '01 Jan 2026 10:00'),
+        # node_modules — must be skipped entirely
+        (r'C:\fake_scan\node_modules\index.js', '01 Jan 2026 10:00'),
+        (r'C:\fake_scan\node_modules\utils.js', '01 Jan 2026 10:00'),
+    ]
+    for path, modified in entries:
+        lines += [
+            '', f'FILE: {path}', 'TYPE: Python | .py', 'SIZE: 2kb',
+            'CREATED:  01 Jan 2026 09:00', f'MODIFIED: {modified}',
+            'READABLE: Yes', '-' * 50,
+        ]
+    return '\n'.join(lines)
+
+
+def test_skip_cluster_folders():
+    print('\n--- SKIP_CLUSTER_FOLDERS ---')
+
+    # Constant exists and contains required entries
+    check('SKIP_CLUSTER_FOLDERS is a set',       isinstance(SKIP_CLUSTER_FOLDERS, (set, frozenset)))
+    check('Microsoft VS Code in skip list',      'Microsoft VS Code' in SKIP_CLUSTER_FOLDERS)
+    check('Smart File Tagger in skip list',      'Smart File Tagger' in SKIP_CLUSTER_FOLDERS)
+    check('.vscode in skip list',                '.vscode'           in SKIP_CLUSTER_FOLDERS)
+    check('extensions in skip list',             'extensions'        in SKIP_CLUSTER_FOLDERS)
+    check('node_modules in skip list',           'node_modules'      in SKIP_CLUSTER_FOLDERS)
+    check('resources in skip list',              'resources'         in SKIP_CLUSTER_FOLDERS)
+    check('AppData in skip list',                'AppData'           in SKIP_CLUSTER_FOLDERS)
+    check('Local in skip list',                  'Local'             in SKIP_CLUSTER_FOLDERS)
+    check('Roaming in skip list',                'Roaming'           in SKIP_CLUSTER_FOLDERS)
+
+    # End-to-end: VS Code files must not appear as cluster or loose file
+    vscode_dir = Path(__file__).parent / 'test_skip_vscode'
+    vscode_dir.mkdir(exist_ok=True)
+    (vscode_dir / 'SIFT_index_full.txt').write_text(
+        make_fake_index_with_vscode(), encoding='utf-8'
+    )
+    (vscode_dir / 'SIFT_index_summary.txt').write_text(
+        'Scanned: C:\\fake_scan\n', encoding='utf-8'
+    )
+    try:
+        result   = build_clusters(vscode_dir)
+        clusters = result['clusters']
+        loose    = result['loose_files']
+        folders  = [c['folder'] for c in clusters]
+        names    = [c['name']   for c in clusters]
+        loose_names = [lf['name'] for lf in loose]
+
+        check('my-project becomes a cluster',
+              any('my-project' in f for f in folders),
+              detail=f'folders={folders}')
+        check('exactly 1 cluster (user project only)',
+              len(clusters) == 1,
+              detail=f'got {len(clusters)}: {names}')
+        check('Microsoft VS Code NOT a cluster',
+              not any('Microsoft VS Code' in f for f in folders),
+              detail=f'folders={folders}')
+        check('node_modules NOT a cluster',
+              not any('node_modules' in f for f in folders),
+              detail=f'folders={folders}')
+        check('VS Code files NOT in loose files',
+              not any('Microsoft VS Code' in lf for lf in loose_names),
+              detail=f'loose={loose_names}')
+        check('node_modules files NOT in loose files',
+              not any('node_modules' in lf for lf in loose_names),
+              detail=f'loose={loose_names}')
+    finally:
+        for item in vscode_dir.iterdir():
+            item.unlink()
+        vscode_dir.rmdir()
+
+
+# ── Component 2 sift.py progress tests ────────────────────────────────────────
+
+def test_time_estimate():
+    print('\n--- time_estimate ---')
+    check('< 500 -> About 1 minute',
+          time_estimate(0)   == 'About 1 minute')
+    check('499 -> About 1 minute',
+          time_estimate(499) == 'About 1 minute')
+    check('500 -> About 2-5 minutes',
+          time_estimate(500) == 'About 2-5 minutes')
+    check('1999 -> About 2-5 minutes',
+          time_estimate(1999) == 'About 2-5 minutes')
+    check('2000 -> About 5-15 minutes',
+          time_estimate(2000) == 'About 5-15 minutes')
+    check('4999 -> About 5-15 minutes',
+          time_estimate(4999) == 'About 5-15 minutes')
+    check('5000 -> This may take a while',
+          'This may take a while' in time_estimate(5000))
+    check('5000 -> mentions machine will slow',
+          'machine will slow' in time_estimate(5000))
+    check('5000 -> says Leave it running',
+          'Leave it running' in time_estimate(5000))
+    check('returns a string',
+          isinstance(time_estimate(100), str))
+
+
+def test_collect_metadata_and_filter():
+    print('\n--- collect_metadata + filter_for_scan ---')
+    with tempfile.TemporaryDirectory() as tmp_scan, \
+         tempfile.TemporaryDirectory() as tmp_out:
+        scan_dir = Path(tmp_scan)
+        out_dir  = Path(tmp_out)
+
+        # Create 3 readable Python files and 1 binary-sized file
+        (scan_dir / 'hello.py').write_text('print("hello")\n' * 10, encoding='utf-8')
+        (scan_dir / 'utils.py').write_text('def foo(): pass\n' * 10, encoding='utf-8')
+        (scan_dir / 'config.py').write_text('DEBUG = True\n' * 10, encoding='utf-8')
+        # File too small to pass filter (< 100 bytes)
+        (scan_dir / 'tiny.py').write_text('x=1\n', encoding='utf-8')
+
+        total = collect_metadata(str(scan_dir), out_dir)
+        check('collect_metadata returns int',   isinstance(total, int))
+        check('found at least 3 files',         total >= 3,   detail=f'got {total}')
+        check('SIFT_metadata.json created',     (out_dir / 'SIFT_metadata.json').exists())
+
+        selected = filter_for_scan(out_dir)
+        check('filter_for_scan returns list',   isinstance(selected, list))
+        # hello.py, utils.py, config.py should pass (>100 bytes, .py extension)
+        # tiny.py is ~4 bytes — should be filtered out
+        check('at least 3 files selected',      len(selected) >= 3,   detail=f'got {len(selected)}')
+        py_files = [p for p in selected if p.endswith('.py')]
+        check('Python files in selection',      len(py_files) >= 3,   detail=str(py_files))
+        check('tiny.py excluded (too small)',
+              not any('tiny.py' in p for p in selected),
+              detail=str(selected))
+
+
 # ── Component 2 tests ──────────────────────────────────────────────────────────
 
 def make_fake_clusters_json(output_dir):
@@ -277,9 +426,9 @@ def make_fake_clusters_json(output_dir):
 def make_fake_index_full_with_imports():
     """
     Fake index_full where:
-    - project-alpha/main.py imports utils and config (both present in cluster) → CAN RUN NOW
-    - broken-app/app.py imports utils, config, database, auth (none present in cluster) → BROKEN
-    - loose-notes has no entry point files → UNKNOWN
+    - project-alpha/main.py imports utils and config (both present in cluster) -> CAN RUN NOW
+    - broken-app/app.py imports utils, config, database, auth (none present in cluster) -> BROKEN
+    - loose-notes has no entry point files -> UNKNOWN
     """
     lines = [
         '=' * 60,
@@ -387,7 +536,7 @@ def test_build_entry_points_end_to_end():
 
 def write_c3_fake_data():
     """
-    3 clusters: CAN RUN NOW + NEARLY THERE + UNKNOWN → actionable_count = 2.
+    3 clusters: CAN RUN NOW + NEARLY THERE + UNKNOWN -> actionable_count = 2.
     Writes SIFT_clusters.json and SIFT_entry_points.json to TEST_DIR.
     """
     id_can   = 'cluster_c3_can00001'
@@ -453,7 +602,7 @@ def test_load_report_data():
           data is not None and any(c['status'] == 'NEARLY THERE' for c in data['clusters']))
     check('scan_folder key present',   data is not None and 'scan_folder' in data)
 
-    # Missing files → returns None
+    # Missing files -> returns None
     (TEST_DIR / 'SIFT_entry_points.json').unlink()
     check('None when entry_points missing', load_report_data(TEST_DIR) is None)
     (TEST_DIR / 'SIFT_clusters.json').unlink()
@@ -465,24 +614,40 @@ def test_load_report_data():
 
 def test_render_opening_page():
     print('\n--- render_opening_page ---')
-    data2 = {'actionable_count': 2, 'clusters': [], 'loose_files': [], 'scan_folder': ''}
-    html2 = render_opening_page(data2)
-    check('contains count 2',          '>2<'            in html2)
-    check('contains START REVIEWING',  'START REVIEWING' in html2)
-    check('button links to /review',   'href="/review"'  in html2)
-    check('plural projects',           'projects you can do something' in html2)
-    check('no percentages',            '%'              not in html2)
-    check('no score words',            'score'          not in html2.lower())
+    # Data with mixed statuses to verify group counts
+    data_mixed = {
+        'clusters': [
+            {'id': 'a1', 'status': 'CAN RUN NOW'},
+            {'id': 'a2', 'status': 'NEARLY THERE'},
+            {'id': 'a3', 'status': 'NEARLY THERE'},
+            {'id': 'a4', 'status': 'BROKEN'},
+            {'id': 'a5', 'status': 'UNKNOWN'},
+        ],
+        'loose_files': [
+            {'path': 'x.txt', 'name': 'x.txt', 'last_touched': 'today'},
+        ],
+        'actionable_count': 3, 'scan_folder': 'test',
+    }
+    html = render_opening_page(data_mixed)
+    check('heading: I looked at your machine',  'I looked at your machine'  in html)
+    check('heading: Here is what I found',      'Here is what I found'      in html)
+    check('contains START REVIEWING',           'START REVIEWING'           in html)
+    check('links to /groups not /review',       'href="/groups"'            in html)
+    check('READY group shown',                  'READY'                     in html)
+    check('NEARLY THERE group shown',           'NEARLY THERE'              in html)
+    check('BROKEN group shown',                 'BROKEN'                    in html)
+    check('FRAGMENTS group shown',              'FRAGMENTS'                 in html)
+    check('LOOSE FILES group shown',            'LOOSE FILES'               in html)
+    # Split after </style> to check visible content only (CSS may use % for layout)
+    html_body = html.split('</style>')[-1]
+    check('no percentage scores in body',        not any(str(n)+'%' in html_body for n in range(101)))
+    check('no score words',                     'score'                     not in html_body.lower())
 
-    data1 = {'actionable_count': 1, 'clusters': [], 'loose_files': [], 'scan_folder': ''}
-    html1 = render_opening_page(data1)
-    check('contains count 1',          '>1<'            in html1)
-    check('singular project',          'project you can do something' in html1)
-
-    data0 = {'actionable_count': 0, 'clusters': [], 'loose_files': [], 'scan_folder': ''}
-    html0 = render_opening_page(data0)
-    check('contains count 0',          '>0<'            in html0)
-    check('zero message',              'no projects are ready' in html0)
+    # Empty data — all zeros, structure still correct
+    data_empty = {'clusters': [], 'loose_files': [], 'actionable_count': 0, 'scan_folder': ''}
+    html0 = render_opening_page(data_empty)
+    check('empty: heading present',             'I looked at your machine'  in html0)
+    check('empty: START REVIEWING present',     'START REVIEWING'           in html0)
 
 
 def test_render_no_scan_page():
@@ -540,7 +705,7 @@ def test_build_review_queue():
     data  = make_c4_data()
     queue = build_review_queue(data)
 
-    # alpha + alpha-v2 → one version_group card. website → one cluster card. notes.md → loose file.
+    # alpha + alpha-v2 -> one version_group card. website -> one cluster card. notes.md -> loose file.
     # Total: 3 cards (not 4 — version group consumes both alpha IDs into one card).
     check('3 cards total',             len(queue) == 3,              f'got {len(queue)}')
     check('first card is version_group', queue[0]['type'] == 'version_group')
@@ -561,18 +726,18 @@ def test_get_current_card():
     data  = make_c4_data()
     queue = build_review_queue(data)
 
-    # Empty decisions → first card
+    # Empty decisions -> first card
     card, idx, total = get_current_card(queue, {})
     check('first card returned',       card is not None)
     check('index is 0',                idx == 0)
     check('total is 3',                total == 3)
 
-    # One decision saved → moves to second card
+    # One decision saved -> moves to second card
     pid0 = queue[0]['primary_id']
     card2, idx2, _ = get_current_card(queue, {pid0: 'FINISH IT'})
     check('second card after 1 decision', idx2 == 1)
 
-    # All decided → returns None
+    # All decided -> returns None
     all_decided = {c['primary_id']: 'PUT AWAY' for c in queue}
     card_done, idx_done, total_done = get_current_card(queue, all_decided)
     check('None when all decided',     card_done is None)
@@ -582,7 +747,7 @@ def test_get_current_card():
 def test_load_save_decisions():
     print('\n--- load_decisions / save_decision ---')
 
-    # Load from missing file → empty dict
+    # Load from missing file -> empty dict
     check('empty when no file',  load_decisions(TEST_DIR) == {})
 
     # Save one decision, load it back
@@ -865,8 +1030,9 @@ def test_render_readback_result():
     check('tier name shown',               'Groq (free tier)'         in html_with)
     check('start_with section shown',      'Alpha Project'            in html_with)
     check('WHERE TO START label',          'WHERE TO START'           in html_with)
-    check('save button present',           'Save this summary'        in html_with)
-    check('posts to /readback/save',       '/readback/save'           in html_with)
+    check('no manual save button',         'Save this summary'        not in html_with)
+    check('no /readback/save link',        '/readback/save'           not in html_with)
+    check('back link to / present',        'href="/"'                 in html_with)
 
     # Without start_with
     html_none = render_readback_result(summary, 'local summary (no AI used)', None)
@@ -880,11 +1046,261 @@ def test_render_readback_result():
     check('no Groq key in result',         'GROQ_API_KEY' not in html_t4)
 
 
+# ── Component 5b: guided flow rebuild ─────────────────────────────────────────
+
+def test_count_by_group():
+    print('\n--- count_by_group ---')
+    data = {
+        'clusters': [
+            {'id': 'x1', 'status': 'CAN RUN NOW'},
+            {'id': 'x2', 'status': 'NEARLY THERE'},
+            {'id': 'x3', 'status': 'NEARLY THERE'},
+            {'id': 'x4', 'status': 'BROKEN'},
+            {'id': 'x5', 'status': 'UNKNOWN'},
+            {'id': 'x6', 'status': 'UNKNOWN'},
+        ],
+        'loose_files': [
+            {'path': 'a.txt', 'name': 'a.txt', 'last_touched': 'today'},
+            {'path': 'b.txt', 'name': 'b.txt', 'last_touched': 'today'},
+            {'path': 'c.txt', 'name': 'c.txt', 'last_touched': 'today'},
+        ],
+    }
+    g = count_by_group(data)
+    check('returns dict',                    isinstance(g, dict))
+    check('has 5 keys',                      len(g) == 5,           f'got {list(g.keys())}')
+    check('READY key present',               'READY' in g)
+    check('NEARLY THERE key present',        'NEARLY THERE' in g)
+    check('BROKEN key present',              'BROKEN' in g)
+    check('FRAGMENTS key present',           'FRAGMENTS' in g)
+    check('LOOSE FILES key present',         'LOOSE FILES' in g)
+    check('READY = 1 (CAN RUN NOW)',         g['READY'] == 1,       f'got {g["READY"]}')
+    check('NEARLY THERE = 2',                g['NEARLY THERE'] == 2, f'got {g["NEARLY THERE"]}')
+    check('BROKEN = 1',                      g['BROKEN'] == 1,      f'got {g["BROKEN"]}')
+    check('FRAGMENTS = 2 (UNKNOWN)',         g['FRAGMENTS'] == 2,   f'got {g["FRAGMENTS"]}')
+    check('LOOSE FILES = 3',                 g['LOOSE FILES'] == 3,  f'got {g["LOOSE FILES"]}')
+
+    # Empty data
+    g_empty = count_by_group({'clusters': [], 'loose_files': []})
+    check('all zeros on empty data',         sum(g_empty.values()) == 0)
+
+
+def test_derive_description():
+    print('\n--- derive_description ---')
+    py_card   = {'type': 'cluster', 'files': [r'C:\p\main.py', r'C:\p\helper.py', r'C:\p\run.py']}
+    html_card = {'type': 'cluster', 'files': [r'C:\p\index.html']}
+    empty_card = {'type': 'cluster', 'files': []}
+    vg_card   = {
+        'type': 'version_group',
+        'files': [],
+        'group_clusters': [
+            {'files': [r'C:\a\main.py']},
+            {'files': [r'C:\b\main.py', r'C:\b\app.py']},
+        ],
+    }
+
+    py_desc   = derive_description(py_card)
+    html_desc = derive_description(html_card)
+    empty_desc = derive_description(empty_card)
+    vg_desc   = derive_description(vg_card)
+
+    check('py: returns string',              isinstance(py_desc, str))
+    check('py: mentions Python code',        'Python code' in py_desc, py_desc)
+    check('py: mentions file count 3',       '3' in py_desc,            py_desc)
+    check('html: mentions web pages',        'web pages' in html_desc,  html_desc)
+    check('html: 1 file singular',           '1 file' in html_desc,     html_desc)
+    check('empty: no crash',                 len(empty_desc) > 0)
+    check('vg: pulls files from group_clusters', 'Python code' in vg_desc, vg_desc)
+    check('vg: total file count 3',          '3' in vg_desc,            vg_desc)
+
+
+def test_render_group_selection():
+    print('\n--- render_group_selection ---')
+    data_full = {
+        'clusters': [
+            {'id': 'r1', 'status': 'CAN RUN NOW'},
+            {'id': 'n1', 'status': 'NEARLY THERE'},
+            {'id': 'b1', 'status': 'BROKEN'},
+            {'id': 'u1', 'status': 'UNKNOWN'},
+        ],
+        'loose_files': [{'path': 'x.txt', 'name': 'x.txt', 'last_touched': 'today'}],
+    }
+    html = render_group_selection(data_full)
+    check('has heading',                     'What do you want to review' in html)
+    check('READY group shown',               'READY'          in html)
+    check('NEARLY THERE shown',              'NEARLY THERE'   in html)
+    check('BROKEN shown',                    'BROKEN'         in html)
+    check('FRAGMENTS shown',                 'FRAGMENTS'      in html)
+    check('LOOSE FILES shown',               'LOOSE FILES'    in html)
+    check('link to /review?group=READY',     '/review?group=READY' in html)
+    check('link to /review?group=NEARLY',    'NEARLY%20THERE' in html or 'NEARLY THERE' in html)
+    check('back link to / present',          'href="/"'       in html)
+    check('valid html open/close',           '<html' in html and '</html>' in html)
+
+    # Zero-count group shown but not linked
+    data_no_broken = {
+        'clusters': [{'id': 'r1', 'status': 'CAN RUN NOW'}],
+        'loose_files': [],
+    }
+    html_nb = render_group_selection(data_no_broken)
+    check('zero group uses div not anchor',  'group-card-empty' in html_nb)
+
+
+def test_build_review_queue_group_filter():
+    print('\n--- build_review_queue group_filter ---')
+    data = {
+        'clusters': [
+            {'id': 'r1', 'folder': r'C:\r1', 'name': 'Ready One',
+             'file_count': 1, 'last_touched': 'today', 'is_version_group': False,
+             'versions': [], 'files': [r'C:\r1\main.py'],
+             'status': 'CAN RUN NOW', 'entry_point': r'C:\r1\main.py',
+             'status_basis': 'ok'},
+            {'id': 'n1', 'folder': r'C:\n1', 'name': 'Nearly One',
+             'file_count': 1, 'last_touched': 'today', 'is_version_group': False,
+             'versions': [], 'files': [r'C:\n1\app.py'],
+             'status': 'NEARLY THERE', 'entry_point': r'C:\n1\app.py',
+             'status_basis': 'ok'},
+            {'id': 'u1', 'folder': r'C:\u1', 'name': 'Unknown One',
+             'file_count': 1, 'last_touched': 'today', 'is_version_group': False,
+             'versions': [], 'files': [r'C:\u1\x.txt'],
+             'status': 'UNKNOWN', 'entry_point': None,
+             'status_basis': 'none'},
+        ],
+        'loose_files': [
+            {'path': r'C:\lf.txt', 'name': 'lf.txt', 'last_touched': 'today'},
+        ],
+    }
+    # No filter -> all 4 items
+    q_all = build_review_queue(data)
+    check('no filter: 4 items',             len(q_all) == 4,    f'got {len(q_all)}')
+
+    # READY filter -> only CAN RUN NOW
+    q_ready = build_review_queue(data, group_filter='READY')
+    check('READY: 1 item',                  len(q_ready) == 1,  f'got {len(q_ready)}')
+    check('READY: correct cluster',         q_ready[0]['name'] == 'Ready One')
+
+    # NEARLY THERE filter
+    q_nearly = build_review_queue(data, group_filter='NEARLY THERE')
+    check('NEARLY THERE: 1 item',           len(q_nearly) == 1, f'got {len(q_nearly)}')
+    check('NEARLY THERE: correct cluster',  q_nearly[0]['name'] == 'Nearly One')
+
+    # FRAGMENTS filter -> UNKNOWN only
+    q_frag = build_review_queue(data, group_filter='FRAGMENTS')
+    check('FRAGMENTS: 1 item',              len(q_frag) == 1,   f'got {len(q_frag)}')
+    check('FRAGMENTS: correct cluster',     q_frag[0]['name'] == 'Unknown One')
+
+    # LOOSE FILES filter -> only loose files
+    q_loose = build_review_queue(data, group_filter='LOOSE FILES')
+    check('LOOSE FILES: 1 item',            len(q_loose) == 1,  f'got {len(q_loose)}')
+    check('LOOSE FILES: is loose_file',     q_loose[0]['type'] == 'loose_file')
+
+    # BROKEN filter (none in data) -> empty queue
+    q_broken = build_review_queue(data, group_filter='BROKEN')
+    check('BROKEN: 0 items when none',      len(q_broken) == 0, f'got {len(q_broken)}')
+
+
+def test_render_card_evidence_first():
+    print('\n--- render_card evidence-first ---')
+    data  = make_c4_data()
+    queue = build_review_queue(data)
+
+    # Individual cluster card (My Website, UNKNOWN, index.html)
+    ind_card = queue[1]
+    html     = render_card(ind_card, 2, 3)
+
+    # Evidence block must appear before the button grid
+    ev_pos  = html.find('evidence-block')
+    btn_pos = html.find('btn-grid')
+    check('evidence-block present',         ev_pos >= 0)
+    check('btn-grid present',               btn_pos >= 0)
+    check('evidence before buttons',        ev_pos < btn_pos,
+          f'ev_pos={ev_pos} btn_pos={btn_pos}')
+
+    # Evidence content
+    check('has plain-English status',       'No clear starting point'   in html)
+    check('has entry point text',           'No starting point found'   in html)
+    check('has last touched',               'Last touched'              in html)
+    check('has derived description',        'file' in html.lower())
+
+    # Buttons have explanatory sub-lines
+    check('FINISH IT sub-line',             'I want to complete this'   in html)
+    check('COME BACK sub-line',             'Not now'                   in html)
+    check('PUT AWAY sub-line',              'I do not need this'        in html)
+    check('START FRESH sub-line',           'Keep nothing'              in html)
+
+    # Change note is AFTER buttons
+    change_pos = html.find('You can change this any time')
+    check('change note present',            change_pos >= 0)
+    check('change note after buttons',      change_pos > btn_pos,
+          f'change_pos={change_pos} btn_pos={btn_pos}')
+
+    # No group -> no back-to-groups link
+    check('no back link without group',     'Back to groups' not in html)
+
+    # With group -> back link present
+    html_grp = render_card(ind_card, 2, 3, group='FRAGMENTS')
+    check('back link with group',           'Back to groups'            in html_grp)
+    check('group in hidden field',          'value="FRAGMENTS"'         in html_grp)
+
+
+def test_css_no_dark_text_colors():
+    print('\n--- CSS: no text colors below #888888 ---')
+    # These specific dark values must not appear as text colors in _BASE_CSS
+    forbidden = [
+        'color: #555555', 'color:#555555',
+        'color: #444444', 'color:#444444',
+        'color: #333333', 'color:#333333',
+        'color: #222222', 'color:#222222',
+    ]
+    for val in forbidden:
+        check(f'no {val} in _BASE_CSS', val not in _BASE_CSS, f'found: {val}')
+
+
+def test_css_button_size():
+    print('\n--- CSS: button accessibility sizes ---')
+    check('btn-decision has min-height',     'min-height' in _BASE_CSS)
+    check('btn-decision has 3rem',           '3rem'       in _BASE_CSS)
+    check('btn-decision has font-weight bold', 'font-weight: bold' in _BASE_CSS
+          or 'font-weight:bold' in _BASE_CSS)
+    check('btn-decision has 1.25rem',        '1.25rem'    in _BASE_CSS)
+    check('btn-sub class present',           'btn-sub'    in _BASE_CSS)
+    check('body has font-size 1.125rem',     '1.125rem'   in _BASE_CSS)
+    check('body has line-height 1.8',        'line-height: 1.8' in _BASE_CSS
+          or 'line-height:1.8' in _BASE_CSS)
+
+
+def test_auto_save_report():
+    print('\n--- auto_save_report ---')
+    save_dir = TEST_DIR / 'auto_save_test'
+    save_dir.mkdir(exist_ok=True)
+
+    dec   = c5_decisions()
+    queue = c5_queue()
+
+    saved_path = auto_save_report(save_dir, dec, queue)
+
+    check('returns a Path',                  isinstance(saved_path, Path))
+    check('file created',                    saved_path.exists())
+    check('filename is SIFT_report_summary.html',
+          saved_path.name == 'SIFT_report_summary.html')
+
+    html = saved_path.read_text(encoding='utf-8')
+    check('valid html open/close',           '<html' in html and '</html>' in html)
+    check('contains Your decisions',         'Your decisions' in html)
+    check('contains Alpha Project',          'Alpha Project'  in html)
+    check('contains decision FINISH IT',     'FINISH IT'      in html)
+    check('contains My Website',             'My Website'     in html)
+    check('no GROQ_API_KEY in saved file',   'GROQ_API_KEY'   not in html)
+
+    # Cleanup
+    saved_path.unlink()
+    save_dir.rmdir()
+
+
 # ── Runner ─────────────────────────────────────────────────────────────────────
 
 def main():
     print('=' * 55)
-    print('SIFT REPORT TEST — Components 1 through 5')
+    print('SIFT REPORT TEST — Components 1 through 5b')
     print('=' * 55)
 
     setup()
@@ -897,6 +1313,11 @@ def main():
         test_get_cluster_root()
         test_detect_version_groups()
         test_build_clusters_end_to_end()
+        test_skip_cluster_folders()
+
+        print('\n-- Component 2: sift.py progress --')
+        test_time_estimate()
+        test_collect_metadata_and_filter()
 
         print('\n-- Component 2: build_entry_points --')
         test_find_entry_point()
@@ -928,6 +1349,16 @@ def main():
         test_find_start_with()
         test_render_readback_consent()
         test_render_readback_result()
+
+        print('\n-- Component 5b: guided flow rebuild --')
+        test_count_by_group()
+        test_derive_description()
+        test_render_group_selection()
+        test_build_review_queue_group_filter()
+        test_render_card_evidence_first()
+        test_css_no_dark_text_colors()
+        test_css_button_size()
+        test_auto_save_report()
     finally:
         teardown()
 

@@ -1,4 +1,4 @@
-import os, sys, json, webbrowser, socket, datetime
+import os, sys, json, webbrowser, socket, datetime, collections
 import urllib.request, urllib.error
 from pathlib import Path
 
@@ -62,6 +62,54 @@ def load_report_data(output_dir):
     }
 
 
+def count_by_group(data):
+    """Count clusters and loose files into the 5 review groups. Returns dict."""
+    groups = {'READY': 0, 'NEARLY THERE': 0, 'BROKEN': 0, 'FRAGMENTS': 0, 'LOOSE FILES': 0}
+    for c in data.get('clusters', []):
+        status = c.get('status', 'UNKNOWN')
+        if status == 'CAN RUN NOW':
+            groups['READY'] += 1
+        elif status == 'NEARLY THERE':
+            groups['NEARLY THERE'] += 1
+        elif status == 'BROKEN':
+            groups['BROKEN'] += 1
+        else:
+            groups['FRAGMENTS'] += 1
+    groups['LOOSE FILES'] = len(data.get('loose_files', []))
+    return groups
+
+
+def derive_description(cluster):
+    """
+    One plain-English sentence from file count and dominant file type. No LLM.
+    Works on cluster cards, version_group cards, and loose-file cards.
+    """
+    files = list(cluster.get('files', []))
+    if cluster.get('type') == 'version_group':
+        for gc in cluster.get('group_clusters', []):
+            files += gc.get('files', [])
+    if not files:
+        return 'No files found.'
+    exts = collections.Counter(
+        Path(f).suffix.lower() for f in files if Path(f).suffix
+    )
+    top_ext = exts.most_common(1)[0][0] if exts else ''
+    ext_map = {
+        '.py': 'Python code',   '.js': 'JavaScript',    '.ts': 'TypeScript',
+        '.html': 'web pages',   '.css': 'stylesheets',  '.json': 'data files',
+        '.md': 'notes',         '.txt': 'text files',   '.csv': 'spreadsheet data',
+        '.ipynb': 'notebooks',  '.sh': 'shell scripts', '.bat': 'batch scripts',
+        '.sql': 'database files', '.java': 'Java code', '.cs': 'C# code',
+        '.rb': 'Ruby code',     '.php': 'PHP code',     '.go': 'Go code',
+        '.rs': 'Rust code',     '.xml': 'config files', '.yaml': 'config files',
+        '.yml': 'config files', '.toml': 'config files', '.ini': 'config files',
+    }
+    type_label = ext_map.get(top_ext, 'mixed files')
+    n = len(files)
+    file_word = 'file' if n == 1 else 'files'
+    return f'{n} {file_word}, mostly {type_label}.'
+
+
 def render_no_scan_page():
     return (
         '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
@@ -85,10 +133,17 @@ def render_no_scan_page():
 
 
 def render_opening_page(data):
-    count        = data['actionable_count']
-    project_word = 'project' if count == 1 else 'projects'
-    label        = ('no projects are ready to work on yet' if count == 0
-                    else f'{project_word} you can do something with today')
+    groups      = count_by_group(data)
+    group_order = ['READY', 'NEARLY THERE', 'BROKEN', 'FRAGMENTS', 'LOOSE FILES']
+    rows = ''
+    for g in group_order:
+        n = groups[g]
+        rows += (
+            '<div class="group-row">'
+            '<span class="group-count">' + str(n) + '</span>'
+            '<span class="group-name">' + g + '</span>'
+            '</div>'
+        )
     return (
         '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
@@ -97,22 +152,71 @@ def render_opening_page(data):
         '* { box-sizing: border-box; margin: 0; padding: 0; }'
         'body { background: #0f0f0f; color: #f0f0f0; font-family: Georgia, serif;'
         '       min-height: 100vh; display: flex; flex-direction: column;'
-        '       align-items: center; justify-content: center;'
-        '       text-align: center; padding: 2rem; }'
-        '.number { font-size: 8rem; font-weight: bold; color: #ffffff; line-height: 1; }'
-        '.label  { font-size: 1.1rem; color: #888888; margin-top: 1rem;'
-        '          margin-bottom: 3.5rem; max-width: 300px; line-height: 1.5; }'
+        '       align-items: center; justify-content: center; padding: 2rem; }'
+        '.opening-wrap { max-width: 640px; width: 100%; }'
+        '.opening-head { font-size: 1.5rem; line-height: 1.6; margin-bottom: 2rem;'
+        '                color: #f0f0f0; }'
+        '.group-summary { margin-bottom: 3rem; }'
+        '.group-row { display: flex; align-items: baseline; gap: 1rem;'
+        '             padding: 0.5rem 0; border-bottom: 1px solid #1a1a1a; }'
+        '.group-count { font-size: 2rem; font-weight: bold; color: #f0f0f0;'
+        '               min-width: 3rem; text-align: right; }'
+        '.group-name { font-size: 1rem; color: #888888; letter-spacing: 0.08em; }'
         '.btn-start { background: #ffffff; color: #0f0f0f; border: none;'
-        '             padding: 1.2rem 3.5rem; font-size: 1rem; font-family: Georgia, serif;'
-        '             letter-spacing: 0.1em; cursor: pointer;'
-        '             text-decoration: none; display: inline-block; }'
+        '             padding: 0.7rem 3.5rem; font-size: 1.25rem; font-weight: bold;'
+        '             min-height: 3rem;'
+        '             font-family: Georgia, serif; letter-spacing: 0.1em;'
+        '             cursor: pointer; text-decoration: none; display: inline-block; }'
         '.btn-start:hover { background: #dddddd; }'
         '</style></head><body>'
-        f'<div class="number">{count}</div>'
-        f'<div class="label">{label}</div>'
-        '<a href="/review" class="btn-start">START REVIEWING</a>'
+        '<div class="opening-wrap">'
+        '<div class="opening-head">I looked at your machine.'
+        ' Here is what I found.</div>'
+        '<div class="group-summary">' + rows + '</div>'
+        '<a href="/groups" class="btn-start">START REVIEWING</a>'
+        '</div>'
         '</body></html>'
     )
+
+
+def render_group_selection(data):
+    """Screen 2: group selection. Shows 5 groups with counts + one-line description."""
+    groups = count_by_group(data)
+    GROUP_DESC = {
+        'READY':        'These projects have a working entry point. You can run them now.',
+        'NEARLY THERE': 'These projects are close. One or two things are missing.',
+        'BROKEN':       'These projects cannot run. Something critical is missing.',
+        'FRAGMENTS':    'Files that belong together but have no clear starting point.',
+        'LOOSE FILES':  'Files not attached to any project.',
+    }
+    group_order = ['READY', 'NEARLY THERE', 'BROKEN', 'FRAGMENTS', 'LOOSE FILES']
+    rows = ''
+    for g in group_order:
+        n    = groups[g]
+        desc = GROUP_DESC[g]
+        word = 'item' if n == 1 else 'items'
+        if n > 0:
+            rows += (
+                '<a href="/review?group=' + g.replace(' ', '%20') + '" class="group-card">'
+                '<div class="gc-count">' + str(n) + ' ' + word + '</div>'
+                '<div class="gc-name">' + g + '</div>'
+                '<div class="gc-desc">' + desc + '</div>'
+                '</a>'
+            )
+        else:
+            rows += (
+                '<div class="group-card group-card-empty">'
+                '<div class="gc-count">0 items</div>'
+                '<div class="gc-name">' + g + '</div>'
+                '<div class="gc-desc">' + desc + '</div>'
+                '</div>'
+            )
+    body = (
+        '<h1>What do you want to review?</h1>'
+        '<div class="group-cards">' + rows + '</div>'
+        '<a href="/" class="back-link">Back to overview</a>'
+    )
+    return _page(body)
 
 
 # ── Components 4 + 5: shared page shell ──────────────────────────────────────
@@ -120,66 +224,93 @@ def render_opening_page(data):
 _BASE_CSS = (
     '* { box-sizing: border-box; margin: 0; padding: 0; }'
     'body { background: #0f0f0f; color: #f0f0f0; font-family: Georgia, serif;'
-    '       min-height: 100vh; padding: 2rem; }'
+    '       min-height: 100vh; padding: 2rem;'
+    '       font-size: 1.125rem; line-height: 1.8; }'
     '.page { max-width: 640px; margin: 0 auto; }'
     '.status-label { display: inline-block; padding: 0.3rem 0.9rem;'
     '                font-size: 0.8rem; letter-spacing: 0.1em; margin-bottom: 1.5rem; }'
     '.card-name { font-size: 2.6rem; font-weight: bold; line-height: 1.1;'
     '             margin-bottom: 0.7rem; }'
+    '.evidence-block { margin-bottom: 2rem; }'
+    '.ev-line { color: #888888; font-size: 1rem; line-height: 1.8;'
+    '           margin-bottom: 0.2rem; }'
     '.card-desc { color: #888888; font-size: 1rem; margin-bottom: 2rem; }'
-    '.change-note { color: #555555; font-size: 0.85rem; margin-bottom: 1.2rem; }'
-    '.btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.7rem; }'
+    '.change-note { color: #888888; font-size: 0.85rem; margin-top: 1rem; }'
+    '.btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.7rem;'
+    '            margin-top: 1.5rem; }'
     '.btn-decision { background: #1a1a1a; color: #f0f0f0; border: 1px solid #2e2e2e;'
-    '                padding: 1rem 0.5rem; font-size: 0.85rem;'
+    '                padding: 0.7rem 0.5rem; font-size: 1.25rem; font-weight: bold;'
+    '                min-height: 3rem;'
     '                font-family: Georgia, serif; letter-spacing: 0.06em;'
     '                cursor: pointer; text-align: center; }'
     '.btn-decision:hover { background: #252525; }'
+    '.btn-sub { display: block; font-size: 0.75rem; font-weight: normal;'
+    '           color: #888888; letter-spacing: 0; margin-top: 0.25rem; }'
     '.btn-primary { background: #ffffff; color: #0f0f0f; border: none;'
-    '               padding: 1rem 2.5rem; font-size: 1rem;'
+    '               padding: 0.7rem 2.5rem; font-size: 1.25rem; font-weight: bold;'
+    '               min-height: 3rem;'
     '               font-family: Georgia, serif; letter-spacing: 0.08em;'
     '               cursor: pointer; margin-top: 2rem; display: inline-block; }'
     '.btn-primary:hover { background: #dddddd; }'
-    '.btn-secondary { background: transparent; color: #555555;'
-    '                 border: 1px solid #333333; padding: 0.8rem 2rem;'
+    '.btn-secondary { background: transparent; color: #888888;'
+    '                 border: 1px solid #888888; padding: 0.8rem 2rem;'
     '                 font-size: 0.9rem; font-family: Georgia, serif;'
     '                 cursor: pointer; margin-top: 1rem; display: inline-block; }'
-    '.btn-secondary:hover { color: #888888; border-color: #555555; }'
+    '.btn-secondary:hover { color: #f0f0f0; border-color: #f0f0f0; }'
+    '.btn-start { background: #ffffff; color: #0f0f0f; border: none;'
+    '             padding: 0.7rem 3.5rem; font-size: 1.25rem; font-weight: bold;'
+    '             min-height: 3rem;'
+    '             font-family: Georgia, serif; letter-spacing: 0.1em;'
+    '             cursor: pointer; text-decoration: none; display: inline-block; }'
+    '.btn-start:hover { background: #dddddd; }'
     'details { margin-top: 2.5rem; }'
-    'summary { color: #444444; font-size: 0.8rem; cursor: pointer;'
+    'summary { color: #888888; font-size: 0.8rem; cursor: pointer;'
     '          letter-spacing: 0.05em; }'
-    'summary:hover { color: #888888; }'
-    '.tech-detail { margin-top: 1rem; color: #555555; font-size: 0.82rem;'
+    'summary:hover { color: #f0f0f0; }'
+    '.tech-detail { margin-top: 1rem; color: #888888; font-size: 0.82rem;'
     '               line-height: 1.8; }'
     '.tech-detail code { background: #1a1a1a; padding: 0.1rem 0.4rem;'
     '                    font-family: monospace; font-size: 0.78rem;'
     '                    word-break: break-all; }'
     '.vg-info { background: #161616; padding: 1rem; margin-bottom: 1.5rem;'
     '           font-size: 0.9rem; line-height: 1.8; }'
-    '.loose-tag { display: inline-block; color: #555555; font-size: 0.82rem;'
+    '.loose-tag { display: inline-block; color: #888888; font-size: 0.82rem;'
     '             letter-spacing: 0.08em; margin-bottom: 1.5rem; }'
-    '.loose-note { color: #444444; font-size: 0.85rem; margin-bottom: 1.5rem; }'
+    '.loose-note { color: #888888; font-size: 0.85rem; margin-bottom: 1.5rem; }'
     '.decision-list { margin: 1.5rem 0 2rem; }'
     '.decision-row { padding: 0.7rem 0; border-bottom: 1px solid #1a1a1a;'
     '                font-size: 0.95rem; }'
     '.dname  { color: #f0f0f0; }'
-    '.darrow { color: #333333; margin: 0 0.5rem; }'
+    '.darrow { color: #888888; margin: 0 0.5rem; }'
     '.dchoice { color: #888888; }'
     '.readback-text { font-size: 1.15rem; line-height: 1.9; color: #e0e0e0;'
     '                 margin-bottom: 2.5rem; }'
     '.start-with { background: #161616; padding: 1.2rem 1.5rem; margin-bottom: 2rem; }'
-    '.sw-label { color: #555555; font-size: 0.78rem; letter-spacing: 0.1em;'
+    '.sw-label { color: #888888; font-size: 0.78rem; letter-spacing: 0.1em;'
     '            margin-bottom: 0.4rem; }'
     '.sw-name { color: #f0f0f0; font-size: 1.1rem; }'
-    '.tier-note { color: #333333; font-size: 0.78rem; margin-top: 2rem; }'
+    '.tier-note { color: #888888; font-size: 0.78rem; margin-top: 2rem; }'
     '.consent-warning { color: #888888; font-size: 0.9rem; line-height: 1.8;'
-    '                   margin-bottom: 2rem; border-left: 2px solid #333333;'
+    '                   margin-bottom: 2rem; border-left: 2px solid #888888;'
     '                   padding-left: 1rem; }'
     'h1 { font-size: 1.9rem; margin-bottom: 1rem; }'
-    'p  { color: #888888; font-size: 0.95rem; line-height: 1.8; margin-bottom: 1rem; }'
-    '.back-link { color: #444444; font-size: 0.82rem; text-decoration: none;'
+    'p  { color: #888888; font-size: 1.125rem; line-height: 1.8; margin-bottom: 1rem; }'
+    '.back-link { color: #888888; font-size: 0.82rem; text-decoration: none;'
     '             display: block; margin-top: 1.5rem; }'
-    '.back-link:hover { color: #888888; }'
+    '.back-link:hover { color: #f0f0f0; }'
     '.warn-text { color: #ef4444; font-size: 0.9rem; margin-bottom: 1rem; }'
+    '.group-cards { display: flex; flex-direction: column; gap: 0.5rem;'
+    '               margin-bottom: 2rem; }'
+    '.group-card { display: block; background: #1a1a1a; padding: 1.2rem 1.5rem;'
+    '              text-decoration: none; color: inherit;'
+    '              border: 1px solid #2e2e2e; }'
+    '.group-card:hover { background: #222222; }'
+    '.group-card-empty { opacity: 0.4; cursor: default; }'
+    '.gc-count { font-size: 0.78rem; color: #888888; letter-spacing: 0.08em;'
+    '            margin-bottom: 0.2rem; }'
+    '.gc-name { font-size: 1.1rem; font-weight: bold; color: #f0f0f0;'
+    '           margin-bottom: 0.3rem; }'
+    '.gc-desc { font-size: 0.9rem; color: #888888; }'
 )
 
 STATUS_COLORS = {
@@ -204,11 +335,34 @@ def _page(body_html):
 
 # ── Component 4: review queue ─────────────────────────────────────────────────
 
-def build_review_queue(data):
+def build_review_queue(data, group_filter=None):
+    """
+    Build the ordered review queue from data.
+    group_filter: one of 'READY', 'NEARLY THERE', 'BROKEN', 'FRAGMENTS', 'LOOSE FILES', or None.
+    When set, only the matching clusters/loose files are returned.
+    """
     clusters    = data['clusters']
     loose_files = data['loose_files']
-    queue       = []
-    consumed    = set()
+
+    # Apply group filter before queue building
+    if group_filter == 'READY':
+        clusters    = [c for c in clusters if c.get('status') == 'CAN RUN NOW']
+        loose_files = []
+    elif group_filter == 'NEARLY THERE':
+        clusters    = [c for c in clusters if c.get('status') == 'NEARLY THERE']
+        loose_files = []
+    elif group_filter == 'BROKEN':
+        clusters    = [c for c in clusters if c.get('status') == 'BROKEN']
+        loose_files = []
+    elif group_filter == 'FRAGMENTS':
+        clusters    = [c for c in clusters if c.get('status') == 'UNKNOWN']
+        loose_files = []
+    elif group_filter == 'LOOSE FILES':
+        clusters    = []
+        # loose_files unchanged
+
+    queue    = []
+    consumed = set()
 
     for c in clusters:
         if c['id'] in consumed:
@@ -304,24 +458,40 @@ def save_decision(output_dir, primary_id, decision, scan_folder):
 
 # ── Component 4: HTML renderers ───────────────────────────────────────────────
 
-def render_card(card, card_num, total_cards):
-    status       = card['status']
+def render_card(card, card_num, total_cards, group=None):
+    status       = card.get('status', 'UNKNOWN')
     color        = STATUS_COLORS.get(status, '#888888')
     name         = card['name']
-    file_count   = card['file_count']
     last_touched = card['last_touched']
     primary_id   = card['primary_id']
-    file_word    = 'file' if file_count == 1 else 'files'
 
-    status_html = (
+    # Plain-English status explanation
+    STATUS_PLAIN = {
+        'CAN RUN NOW':  'This project can be run now.',
+        'NEARLY THERE': 'This project is close to working.',
+        'BROKEN':       'This project cannot run without fixing something.',
+        'UNKNOWN':      'No clear starting point was found.',
+    }
+    status_plain = STATUS_PLAIN.get(status, '')
+
+    # Entry point: yes or no (path stays in tech detail)
+    ep      = card.get('entry_point')
+    ep_text = 'Has a starting point.' if ep else 'No starting point found.'
+
+    # Evidence block — evidence before decisions
+    desc = derive_description(card)
+    evidence_html = (
         '<div class="status-label" style="color:' + color
         + ';border:1px solid ' + color + ';">' + status + '</div>'
+        '<div class="card-name">' + name + '</div>'
+        '<div class="evidence-block">'
+        '<p class="ev-line">' + desc + '</p>'
+        '<p class="ev-line">Last touched ' + last_touched + '.</p>'
+        '<p class="ev-line">' + status_plain + ' ' + ep_text + '</p>'
+        '</div>'
     )
-    desc_html = (
-        '<div class="card-desc">'
-        + str(file_count) + ' ' + file_word + ', last touched ' + last_touched
-        + '</div>'
-    )
+
+    # Version group detail (versions shown together)
     vg_html = ''
     if card['type'] == 'version_group':
         rows = ''
@@ -335,38 +505,70 @@ def render_card(card, card_num, total_cards):
             )
         vg_html = '<div class="vg-info">' + rows + '</div>'
 
-    ep       = card.get('entry_point') or 'none found'
-    sb       = card.get('status_basis') or 'no detail available'
-    tech_html = (
-        '<details><summary>Show technical detail</summary>'
-        '<div class="tech-detail">'
-        'Entry point: <code>' + ep + '</code><br>'
-        'Basis: ' + sb
-        + '</div></details>'
+    # Group hidden field preserves filter state through decide → review
+    group_field = (
+        '<input type="hidden" name="group" value="' + group + '">'
+        if group else ''
     )
+
+    # Decision buttons with explanatory sub-lines
+    BUTTON_LINES = [
+        ('FINISH IT',      'I want to complete this.'),
+        ('COME BACK TO IT','Not now, but I have not given up.'),
+        ('PUT AWAY',       'I do not need this any more.'),
+        ('START FRESH',    'Keep nothing. Start again.'),
+    ]
+    buttons = ''
+    for label, sub in BUTTON_LINES:
+        buttons += (
+            '<button class="btn-decision" type="submit" name="decision" value="'
+            + label + '">'
+            + label
+            + '<span class="btn-sub">' + sub + '</span>'
+            '</button>'
+        )
+
     form_html = (
         '<form action="/decide" method="POST">'
         '<input type="hidden" name="primary_id" value="' + primary_id + '">'
+        + group_field
+        + '<div class="btn-grid">' + buttons + '</div>'
         '<p class="change-note">You can change this any time before you finish.</p>'
-        '<div class="btn-grid">'
-        '<button class="btn-decision" type="submit" name="decision" value="FINISH IT">FINISH IT</button>'
-        '<button class="btn-decision" type="submit" name="decision" value="COME BACK TO IT">COME BACK TO IT</button>'
-        '<button class="btn-decision" type="submit" name="decision" value="PUT AWAY">PUT AWAY</button>'
-        '<button class="btn-decision" type="submit" name="decision" value="START FRESH">START FRESH</button>'
-        '</div></form>'
+        '</form>'
     )
-    body = (
-        status_html
-        + '<div class="card-name">' + name + '</div>'
-        + desc_html + vg_html + form_html + tech_html
+
+    # Technical detail hidden — opt-in only
+    ep_val    = ep or 'none found'
+    sb        = card.get('status_basis') or 'no detail available'
+    tech_html = (
+        '<details><summary>Show technical detail</summary>'
+        '<div class="tech-detail">'
+        'Entry point: <code>' + ep_val + '</code><br>'
+        'Basis: ' + sb
+        + '</div></details>'
     )
+
+    back_html = (
+        '<a href="/groups" class="back-link">Back to groups</a>'
+        if group else ''
+    )
+
+    body = evidence_html + vg_html + form_html + tech_html + back_html
     return _page(body)
 
 
-def render_loose_file_card(card, card_num, total_cards):
+def render_loose_file_card(card, card_num, total_cards, group=None):
     primary_id   = card['primary_id']
     name         = card['name']
     last_touched = card['last_touched']
+    group_field  = (
+        '<input type="hidden" name="group" value="' + group + '">'
+        if group else ''
+    )
+    back_html = (
+        '<a href="/groups" class="back-link">Back to groups</a>'
+        if group else ''
+    )
     body = (
         '<div class="loose-tag">loose file, not connected to any project</div>'
         '<div class="card-name">' + name + '</div>'
@@ -374,13 +576,16 @@ def render_loose_file_card(card, card_num, total_cards):
         '<p class="loose-note">Nothing here is deleted. These options only flag the file.</p>'
         '<form action="/decide" method="POST">'
         '<input type="hidden" name="primary_id" value="' + primary_id + '">'
-        '<p class="change-note">You can change this any time before you finish.</p>'
-        '<div class="btn-grid">'
+        + group_field
+        + '<div class="btn-grid">'
         '<button class="btn-decision" type="submit" name="decision"'
         ' value="ATTACH TO A PROJECT">ATTACH TO A PROJECT</button>'
         '<button class="btn-decision" type="submit" name="decision"'
         ' value="MOVE OUT OF THE WAY">MOVE OUT OF THE WAY</button>'
-        '</div></form>'
+        '</div>'
+        '<p class="change-note">You can change this any time before you finish.</p>'
+        '</form>'
+        + back_html
     )
     return _page(body)
 
@@ -621,6 +826,50 @@ def find_start_with(decisions_dict, review_queue):
     return None
 
 
+def auto_save_report(output_dir, decisions_dict, review_queue):
+    """
+    Auto-save an HTML summary to SIFT_report_summary.html in output_dir.
+    Called on CONFIRM AND FINISH — no user action needed.
+    Returns the Path where the file was saved.
+    """
+    summary    = python_fallback_summary(decisions_dict, review_queue)
+    start_with = find_start_with(decisions_dict, review_queue)
+
+    rows = []
+    for card in review_queue:
+        pid = card['primary_id']
+        dec = decisions_dict.get(pid, 'no decision')
+        rows.append(
+            '<div class="decision-row">'
+            '<span class="dname">'   + card['name']  + '</span>'
+            '<span class="darrow">&rarr;</span>'
+            '<span class="dchoice">' + dec           + '</span>'
+            '</div>'
+        )
+
+    start_html = ''
+    if start_with:
+        start_html = (
+            '<div class="start-with">'
+            '<p class="sw-label">WHERE TO START</p>'
+            '<p class="sw-name">' + start_with + '</p>'
+            '</div>'
+        )
+
+    body = (
+        '<h1>Your decisions</h1>'
+        '<p>' + summary + '</p>'
+        + start_html
+        + '<div class="decision-list">' + ''.join(rows) + '</div>'
+        '<a href="/" class="back-link">Start over</a>'
+    )
+    html      = _page(body)
+    save_path = Path(output_dir) / 'SIFT_report_summary.html'
+    with open(save_path, 'w', encoding='utf-8') as fout:
+        fout.write(html)
+    return save_path
+
+
 def render_readback_consent():
     """HTML for the readback consent page — shown before any API call."""
     body = (
@@ -642,7 +891,7 @@ def render_readback_consent():
 
 
 def render_readback_result(summary_text, tier_name, start_with):
-    """HTML for the readback result page."""
+    """HTML for the readback result page. Summary was auto-saved at confirm step."""
     start_html = ''
     if start_with:
         start_html = (
@@ -651,16 +900,11 @@ def render_readback_result(summary_text, tier_name, start_with):
             '<p class="sw-name">' + start_with + '</p>'
             '</div>'
         )
-    save_html = (
-        '<form action="/readback/save" method="POST">'
-        '<button class="btn-secondary" type="submit">Save this summary</button>'
-        '</form>'
-    )
     body = (
         '<div class="readback-text">' + summary_text + '</div>'
         + start_html
         + '<p class="tier-note">Generated using: ' + tier_name + '</p>'
-        + save_html
+        + '<a href="/" class="back-link">Start over</a>'
     )
     return _page(body)
 
@@ -680,6 +924,16 @@ if FLASK_AVAILABLE:
             return Response(render_no_scan_page(), mimetype='text/html')
         return Response(render_opening_page(data), mimetype='text/html')
 
+    @app.route('/groups')
+    def groups():
+        output_dir = find_latest_output_dir()
+        if not output_dir:
+            return Response(render_no_scan_page(), mimetype='text/html')
+        data = load_report_data(output_dir)
+        if data is None:
+            return Response(render_no_scan_page(), mimetype='text/html')
+        return Response(render_group_selection(data), mimetype='text/html')
+
     @app.route('/review')
     def review():
         output_dir = find_latest_output_dir()
@@ -688,15 +942,19 @@ if FLASK_AVAILABLE:
         data = load_report_data(output_dir)
         if data is None:
             return Response(render_no_scan_page(), mimetype='text/html')
-        queue     = build_review_queue(data)
+        group     = request.args.get('group', '').strip() or None
+        queue     = build_review_queue(data, group_filter=group)
         decisions = load_decisions(output_dir)
         card, card_num, total = get_current_card(queue, decisions)
         if card is None:
+            # Group exhausted -> back to group selection; all done -> apply
+            if group:
+                return redirect(url_for('groups'))
             return redirect(url_for('apply_decisions'))
         if card['type'] == 'loose_file':
-            html = render_loose_file_card(card, card_num + 1, total)
+            html = render_loose_file_card(card, card_num + 1, total, group=group)
         else:
-            html = render_card(card, card_num + 1, total)
+            html = render_card(card, card_num + 1, total, group=group)
         return Response(html, mimetype='text/html')
 
     @app.route('/decide', methods=['POST'])
@@ -709,8 +967,11 @@ if FLASK_AVAILABLE:
             return redirect(url_for('index'))
         primary_id = request.form.get('primary_id', '').strip()
         decision   = request.form.get('decision',   '').strip()
+        group      = request.form.get('group',      '').strip()
         if primary_id and decision:
             save_decision(output_dir, primary_id, decision, data['scan_folder'])
+        if group:
+            return redirect(url_for('review', group=group))
         return redirect(url_for('review'))
 
     @app.route('/apply')
@@ -732,6 +993,17 @@ if FLASK_AVAILABLE:
     @app.route('/apply/step2', methods=['GET', 'POST'])
     def apply_step2():
         if request.method == 'POST':
+            # Auto-save HTML summary before redirecting to readback
+            output_dir = find_latest_output_dir()
+            if output_dir:
+                data = load_report_data(output_dir)
+                if data:
+                    queue     = build_review_queue(data)
+                    decisions = load_decisions(output_dir)
+                    try:
+                        auto_save_report(output_dir, decisions, queue)
+                    except Exception:
+                        pass  # auto-save failure must not block the flow
             return redirect(url_for('readback'))
         return Response(render_apply_step2(), mimetype='text/html')
 
@@ -762,39 +1034,6 @@ if FLASK_AVAILABLE:
             render_readback_result(summary_text, tier_name, start_with),
             mimetype='text/html'
         )
-
-    @app.route('/readback/save', methods=['POST'])
-    def readback_save():
-        output_dir = find_latest_output_dir()
-        if not output_dir:
-            return redirect(url_for('index'))
-        data = load_report_data(output_dir)
-        if data is None:
-            return redirect(url_for('index'))
-        queue      = build_review_queue(data)
-        decisions  = load_decisions(output_dir)
-        summary    = python_fallback_summary(decisions, queue)
-        start_with = find_start_with(decisions, queue)
-
-        save_path = output_dir / 'SIFT_readback_summary.txt'
-        with open(save_path, 'w', encoding='utf-8') as f:
-            f.write('SIFT READBACK SUMMARY\n')
-            f.write('=' * 40 + '\n\n')
-            f.write(summary + '\n\n')
-            if start_with:
-                f.write('Where to start: ' + start_with + '\n\n')
-            f.write('Full decisions:\n')
-            for card in queue:
-                pid = card['primary_id']
-                dec = decisions.get(pid, 'no decision')
-                f.write('  ' + card['name'] + ': ' + dec + '\n')
-
-        body = (
-            '<h1>Summary saved.</h1>'
-            '<p>Saved to the output folder alongside your scan data.</p>'
-            '<a href="/" class="back-link">Start over</a>'
-        )
-        return Response(_page(body), mimetype='text/html')
 
 
 # ── Server startup ────────────────────────────────────────────────────────────

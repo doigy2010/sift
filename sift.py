@@ -63,6 +63,19 @@ SKIP_DIRS = {
 }
 
 
+# ── Time estimate ─────────────────────────────────────────────────────────────
+def time_estimate(n_files):
+    """Return plain English scan time estimate based on file count."""
+    if n_files < 500:
+        return "About 1 minute"
+    if n_files < 2000:
+        return "About 2-5 minutes"
+    if n_files < 5000:
+        return "About 5-15 minutes"
+    return ("This may take a while. Your machine will slow slightly. "
+            "Leave it running.")
+
+
 # ── Redaction patterns ────────────────────────────────────────────────────────
 REDACT_PATTERNS = [
     (re.compile(r'((?:api[_-]?key|api[_-]?secret|access[_-]?token|auth[_-]?token|secret[_-]?key|private[_-]?key)\s*[:=]\s*)([^\s\n\r]{8,})', re.IGNORECASE), r'\1[REDACTED]'),
@@ -450,17 +463,30 @@ def walk_and_index(scan_roots, output_dir):
     print(f"Pass 1 complete: {total} files found")
 
     target_files = filter_for_scan(output_dir)
-    print(f"Pass 2 scanning: {len(target_files)} files selected")
+    n_targets    = len(target_files)
+    print(f"Pass 2 scanning: {n_targets} files selected")
+    print(f"Time estimate:   {time_estimate(n_targets)}")
 
     meta_path = output_dir / 'SIFT_metadata.json'
     if meta_path.exists():
         meta_path.unlink()
 
+    try:
+        from tqdm import tqdm as _tqdm
+        _use_tqdm = True
+    except ImportError:
+        _use_tqdm = False
+
     print("Scanning files...")
     scan_count = 0
 
+    _iter = (
+        _tqdm(target_files, desc='Scanning', unit='file', ncols=72)
+        if _use_tqdm else target_files
+    )
+
     with open(store_path, 'w', encoding='utf-8') as store_file:
-        for file_path_str in target_files:
+        for file_path_str in _iter:
             fpath = Path(file_path_str)
             fname = fpath.name
 
@@ -470,9 +496,15 @@ def walk_and_index(scan_roots, output_dir):
             folder_set.add(str(fpath.parent))
             scan_count += 1
 
-            # Progress — every 100 files
-            if scan_count % 100 == 0:
-                print(f"\r  {scan_count} files... {fname[:40]:<40}", end='', flush=True)
+            # Progress — tqdm bar or ASCII fallback every 50 files
+            if _use_tqdm:
+                _iter.set_postfix_str(fname[:40], refresh=False)
+            elif scan_count % 50 == 0:
+                pct    = scan_count / max(n_targets, 1)
+                filled = int(30 * pct)
+                bar    = '#' * filled + '-' * (30 - filled)
+                print(f'\r  [{bar}] {scan_count}/{n_targets}  {fname[:40]:<40}',
+                      end='', flush=True)
 
             ext = fpath.suffix.lower()
 
@@ -547,7 +579,8 @@ def walk_and_index(scan_roots, output_dir):
 
             time.sleep(THROTTLE_DELAY)
 
-    print(f"\r  {scan_count} files scanned.{' '*50}")
+    if not _use_tqdm:
+        print(f'\r  {scan_count} files scanned.{" " * 50}')
     return total, n_readable, n_binary, lang_counts, flagged, unreadable, list(folder_set)
 
 
@@ -717,7 +750,7 @@ def mode_scan(output_dir, scan_root, plain_english=False):
     print(f"Clusters:      SIFT_clusters.json     ({len(cluster_map)} clusters)")
     print(f"Entry points:  SIFT_entry_points.json  ({len(entry_points)} found)")
 
-    return scan_id, output_dir
+    return scan_id, output_dir, total, n_readable, len(cluster_map)
 
 
 # ── Machine context generator ─────────────────────────────────────────────────
@@ -1157,10 +1190,13 @@ def main():
 
     # Mode 1 — get user type
     print()
-    print("Who is using SIFT today?")
+    print("Who is running SIFT today?")
     print()
-    print("  1 - Builder or tinkerer  (plain English, no jargon)")
-    print("  2 - Developer            (full technical detail)")
+    print("  1 -- I am a builder or tinkerer")
+    print("       Plain English output. No technical terms.")
+    print()
+    print("  2 -- I am a developer")
+    print("       Full technical detail included.")
     print()
     user_type     = input("Enter 1 or 2: ").strip()
     plain_english = (user_type == "1")
@@ -1168,8 +1204,13 @@ def main():
     print()
     print("What do you want to scan?")
     print()
-    print("  1 - Whole machine  (recommended for unknown laptops)")
-    print("  2 - Specific folder")
+    print("  1 -- My whole machine")
+    print("       Finds everything. Takes longer.")
+    print("       Best for: I have no idea what I have.")
+    print()
+    print("  2 -- One specific folder")
+    print("       Faster. Focused.")
+    print("       Best for: I know roughly where things are.")
     print()
     scan_choice = input("Enter 1 or 2: ").strip()
 
@@ -1210,7 +1251,8 @@ def main():
     output_dir.mkdir(exist_ok=True)
     print(f"\nOutput folder: {output_dir}\n")
 
-    scan_id, output_dir = mode_scan(output_dir, scan_root, plain_english)
+    scan_id, output_dir, total_files, readable_files, cluster_count = \
+        mode_scan(output_dir, scan_root, plain_english)
 
     # Zip output — uses pyzipper for real AES encryption if available
     print()
@@ -1248,21 +1290,17 @@ def main():
     print("=" * 60)
     print("SIFT SCAN COMPLETE")
     print("=" * 60)
-    print(f"Scan ID: {scan_id}")
-    print(f"Output:  {output_dir}")
+    print(f"Files found:    {total_files}")
+    print(f"Files scanned:  {readable_files}")
+    print(f"Projects found: {cluster_count}")
+    print("=" * 60)
     print()
-    print("NEXT STEPS:")
-    print("1. Open SIFT_index_summary.txt — start here")
-    print("2. Upload to Claude in a FRESH INCOGNITO window")
-    print("3. LLM replies with what it found and files it needs")
-    print("4. Run SIFT again, choose option 2, paste the file list")
-    print("5. Upload SIFT_retrieved file back to same LLM conversation")
-    print("6. Repeat steps 2-5 for GPT, Gemini, Groq independently")
-    print("7. Use SIFT_ensemble_prompt.txt to compare all results")
+    print("Your report is opening in your browser now.")
     print()
-    print(f"Email {zip_path.name} to yourself NOW")
+    print("If the browser did not open automatically:")
+    print("  sift_report.py will show you the URL when it starts.")
     print()
-    input("Press Enter to close.")
+    print("=" * 60)
 
 
 if __name__ == '__main__':
