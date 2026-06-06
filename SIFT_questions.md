@@ -42,7 +42,68 @@ RAISED: June 2026
 
 Q: What is the Python extraction pipeline
    that feeds the LLM evidence package?
-A: Not yet designed. Intelligence layer session
-   will produce the build specification.
-STATUS: Open
+A: build_descriptions.py runs after
+   build_entry_points.py. For each cluster:
+   read first + last 20 lines of every file.
+   Extract imports, function names, docstrings,
+   comments, headings, file names. Map imports
+   to purpose labels via lookup table. Extract
+   domain nouns from function names. Run
+   connected-components on connection map to
+   find sub-projects. Assemble evidence package.
+   Write all packages to SIFT_descriptions.json.
+   No LLM calls at this stage — pure Python.
+STATUS: Answered — intelligence layer design
+RAISED: June 2026
+
+Q: How does Python detect sub-projects
+   within a cluster?
+A: Load SIFT_connection_map.json. Filter to
+   edges between files within this cluster only.
+   Run connected-components (DFS/BFS). Each
+   component with 2+ files = one sub-project.
+   Single files with no edges = standalone.
+   Files imported by multiple components =
+   shared utilities, labelled separately.
+   CRITICAL GAP: SIFT_clusters.json contains
+   only file path lists — no connection edges.
+   The connection map is built in memory by
+   build_connection_map() in sift.py and then
+   discarded. sift.py must be modified to save
+   it as SIFT_connection_map.json before
+   build_descriptions.py can use it.
+STATUS: Gap identified — prerequisite required
+RAISED: June 2026
+
+Q: What is the minimum evidence package
+   that can prompt an LLM to write a
+   plain English project description?
+A: Max 500 tokens. Plain key-value text format.
+   Fields: cluster_name, file_count, languages,
+   purpose_signals (top 5), domain_vocabulary
+   (top 10, sensitive nouns stripped),
+   readme_summary (200 chars prose only),
+   sub_projects (label/count/signals/entry/
+   connection per part), connection_summary,
+   last_touched, incomplete_signals (max 3),
+   content_hash (MD5 for cache invalidation).
+   ~243 tokens for a 3-sub-project cluster.
+   LLM never sees raw files or file paths.
+STATUS: Answered — intelligence layer design
+RAISED: June 2026
+
+Q: What gaps remain that the design
+   session did not resolve?
+A: Connection map not persisted — must save
+   SIFT_connection_map.json before building.
+   Description quality drift as models change —
+   no version tag on cached descriptions (v2).
+   User cannot correct a wrong description (v2).
+   Two clusters that are the same project in
+   two folders seen as separate (no fix in v1).
+   Data-only clusters cannot be described
+   without violating privacy constraint.
+   Network-mounted drive speed not tested.
+   Non-English domain vocabulary not handled.
+STATUS: Deferred to v2 unless critical
 RAISED: June 2026
