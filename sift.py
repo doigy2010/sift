@@ -467,6 +467,21 @@ def walk_and_index(scan_roots, output_dir):
     print(f"Pass 2 scanning: {n_targets} files selected")
     print(f"Time estimate:   {time_estimate(n_targets)}")
 
+    # Checkpoint: auto-resume if previous scan was interrupted
+    checkpoint_path = output_dir / 'SIFT_checkpoint.json'
+    already_scanned = set()
+    scanned_in_run  = []
+    if checkpoint_path.exists():
+        try:
+            with open(checkpoint_path, encoding='utf-8') as _cp:
+                _cp_data = json.load(_cp)
+            already_scanned = set(_cp_data.get('scanned_files', []))
+            if already_scanned:
+                target_files = [f for f in target_files if f not in already_scanned]
+                print(f'Previous scan interrupted at file {len(already_scanned)} of {n_targets}. Resuming...')
+        except Exception:
+            pass
+
     meta_path = output_dir / 'SIFT_metadata.json'
     if meta_path.exists():
         meta_path.unlink()
@@ -495,6 +510,16 @@ def walk_and_index(scan_roots, output_dir):
 
             folder_set.add(str(fpath.parent))
             scan_count += 1
+            scanned_in_run.append(file_path_str)
+            if scan_count % 100 == 0:
+                _cp_all = list(already_scanned) + scanned_in_run
+                _cp_tmp = checkpoint_path.with_suffix('.tmp')
+                with open(_cp_tmp, 'w', encoding='utf-8') as _cpf:
+                    json.dump({'scanned_files': _cp_all,
+                               'total_found': n_targets + len(already_scanned),
+                               'checkpoint_at': datetime.datetime.now().isoformat()},
+                              _cpf, indent=2)
+                _cp_tmp.replace(checkpoint_path)
 
             # Progress — tqdm bar or ASCII fallback every 50 files
             if _use_tqdm:
@@ -581,6 +606,8 @@ def walk_and_index(scan_roots, output_dir):
 
     if not _use_tqdm:
         print(f'\r  {scan_count} files scanned.{" " * 50}')
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
     return total, n_readable, n_binary, lang_counts, flagged, unreadable, list(folder_set)
 
 
@@ -741,8 +768,10 @@ def mode_scan(output_dir, scan_root, plain_english=False):
 
     connection_map = build_connection_map(scanned_file_list, store_path)
     conn_map_path = output_dir / 'SIFT_connection_map.json'
-    with open(conn_map_path, 'w', encoding='utf-8') as _f:
+    _tmp_conn = conn_map_path.with_suffix('.tmp')
+    with open(_tmp_conn, 'w', encoding='utf-8') as _f:
         json.dump(connection_map, _f, indent=2)
+    _tmp_conn.replace(conn_map_path)
     cluster_map    = detect_clusters(connection_map, output_dir)
     entry_points   = find_entry_points(cluster_map, connection_map)
 

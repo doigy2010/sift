@@ -3,10 +3,12 @@
 # TRIGGERS: nothing
 # OUTPUTS-TO: SIFT_descriptions.json (same output folder)
 
-import os, sys, re, json, hashlib, collections
+import os, sys, re, json, hashlib, collections, time
 from pathlib import Path
 
 SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
+
+THROTTLE_DELAY = 0.05
 
 LANG_MAP = {
     '.py': 'Python', '.js': 'JavaScript', '.ts': 'TypeScript',
@@ -153,6 +155,7 @@ def extract_signals(filepath):
     }
 
     try:
+        file_size = os.path.getsize(filepath)
         with open(filepath, 'r', encoding='utf-8', errors='replace') as fh:
             all_lines = fh.readlines()
     except Exception as exc:
@@ -164,13 +167,19 @@ def extract_signals(filepath):
         if len(line) > 5000:
             return signals
 
-    # License in first 20 lines → extend read window to 40
-    first_20 = all_lines[:20]
-    license_hits = sum(1 for ln in first_20 if LICENSE_PAT.search(ln))
-    top_lines = all_lines[:40] if license_hits > 10 else first_20
-
-    last_20 = all_lines[-20:] if len(all_lines) > 20 else all_lines
-    combined = top_lines + last_20
+    # Tiered reading: full / first+last 100 / first+last 20 based on file size
+    if file_size < 51200:
+        combined = all_lines
+        top_lines = all_lines
+    elif file_size < 512000:
+        top_lines = all_lines[:100]
+        combined = top_lines + (all_lines[-100:] if len(all_lines) > 100 else [])
+    else:
+        first_20 = all_lines[:20]
+        license_hits = sum(1 for ln in first_20 if LICENSE_PAT.search(ln))
+        top_lines = all_lines[:40] if license_hits > 10 else first_20
+        last_20 = all_lines[-20:] if len(all_lines) > 20 else all_lines
+        combined = top_lines + last_20
     combined_text = ''.join(combined)
 
     seen_imports = set()
@@ -642,10 +651,13 @@ def assemble_all_packages(clusters, output_dir):
             print(f'  {name} -- done')
         except Exception as exc:
             print(f'  {name} -- ERROR: {exc}')
+        time.sleep(THROTTLE_DELAY)
 
     desc_path = output_dir / 'SIFT_descriptions.json'
-    with open(desc_path, 'w', encoding='utf-8') as fh:
+    tmp_path = desc_path.with_suffix('.tmp')
+    with open(tmp_path, 'w', encoding='utf-8') as fh:
         json.dump(descriptions, fh, indent=2)
+    tmp_path.replace(desc_path)
 
     return descriptions
 

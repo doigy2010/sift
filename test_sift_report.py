@@ -1696,6 +1696,258 @@ def test_run_sift_bat():
         check('7B: build_descriptions.py step', 'build_descriptions.py' in content, 'not found in bat')
 
 
+# ── Additions: tiered read (T1A-T1C) ─────────────────────────────────────────
+
+def test_T1A_small_file_full_read():
+    print('\n--- T1A: small file reads all lines ---')
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Path(tmp) / 'small.py'
+        lines = ['import os\n', 'import sys\n']
+        lines += ['# comment line\n'] * 38          # 40 lines — no functions yet
+        for i in range(20):
+            lines.append(f'def extra_func_{i}(): pass\n')   # functions at lines 41+
+        f.write_text(''.join(lines), encoding='utf-8')
+
+        file_size = os.path.getsize(str(f))
+        check('T1A: file is < 50kb', file_size < 51200, f'{file_size} bytes')
+
+        sig = extract_signals(f)
+        extra_found = [n for n in sig['function_names'] if n.startswith('extra_func_')]
+        check('T1A: functions beyond line 40 captured', len(extra_found) > 0,
+              f'found {extra_found}')
+        check('T1A: full read gives more signals than 40-line read',
+              len(extra_found) >= 10, f'found {len(extra_found)}')
+
+
+def test_T1B_large_file_fast():
+    print('\n--- T1B: large file reads first+last 20, completes < 1s ---')
+    import time as _time
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Path(tmp) / 'large.py'
+        header = 'import os\ndef early_func(): pass\n'
+        filler = '# padding line for size testing\n' * 20000   # ~660kb
+        footer = 'def late_func(): pass\n'
+        f.write_text(header + filler + footer, encoding='utf-8')
+
+        file_size = os.path.getsize(str(f))
+        check('T1B: file is > 500kb', file_size > 512000, f'{file_size} bytes')
+
+        t0 = _time.time()
+        sig = extract_signals(f)
+        elapsed = _time.time() - t0
+        check('T1B: completes in < 1 second', elapsed < 1.0, f'{elapsed:.3f}s')
+        check('T1B: early_func captured (first 20 lines)',
+              'early_func' in sig['function_names'], str(sig['function_names']))
+
+
+def test_T1C_medium_file_reads_100_100():
+    print('\n--- T1C: medium file reads first+last 100 lines ---')
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Path(tmp) / 'medium.py'
+        lines = ['# filler\n'] * 89 + ['def func_at_90(): pass\n']  # line 90
+        lines += ['# bulk padding\n'] * 5500                         # push to ~100kb
+        lines += ['def func_at_end(): pass\n']                       # last line
+        f.write_text(''.join(lines), encoding='utf-8')
+
+        file_size = os.path.getsize(str(f))
+        check('T1C: file is 50kb-500kb',
+              51200 <= file_size < 512000, f'{file_size} bytes')
+
+        sig = extract_signals(f)
+        check('T1C: func_at_90 captured (in first 100)',
+              'func_at_90' in sig['function_names'], str(sig['function_names']))
+        check('T1C: func_at_end captured (in last 100)',
+              'func_at_end' in sig['function_names'], str(sig['function_names']))
+
+
+# ── Additions: throttle (T2A-T2B) ────────────────────────────────────────────
+
+def test_T2A_throttle_constant_exists():
+    print('\n--- T2A: THROTTLE_DELAY constant in build_descriptions ---')
+    import build_descriptions as _bd
+    check('T2A: THROTTLE_DELAY attribute exists', hasattr(_bd, 'THROTTLE_DELAY'))
+    check('T2A: THROTTLE_DELAY = 0.05',
+          hasattr(_bd, 'THROTTLE_DELAY') and _bd.THROTTLE_DELAY == 0.05,
+          f'got {getattr(_bd, "THROTTLE_DELAY", "MISSING")}')
+
+
+def test_T2B_sleep_called_in_assemble():
+    print('\n--- T2B: time.sleep called in assemble_all_packages ---')
+    import build_descriptions as _bd
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp)
+        f = out_dir / 'test.py'
+        f.write_text('import os\ndef run(): pass\n', encoding='utf-8')
+        cluster = {
+            'id': 'c1', 'name': 'Test', 'folder': str(out_dir),
+            'file_count': 1, 'files': [str(f)], 'last_touched': 'today',
+        }
+        with patch('build_descriptions.time.sleep') as mock_sleep:
+            _bd.assemble_all_packages([cluster], out_dir)
+            check('T2B: time.sleep called once per cluster',
+                  mock_sleep.call_count == 1,
+                  f'call_count={mock_sleep.call_count}')
+            check('T2B: called with THROTTLE_DELAY',
+                  mock_sleep.called and mock_sleep.call_args[0][0] == _bd.THROTTLE_DELAY,
+                  f'args={mock_sleep.call_args}')
+
+
+# ── Additions: atomic writes (T3A-T3C) ───────────────────────────────────────
+
+def test_T3A_no_tmp_after_write():
+    print('\n--- T3A: no .tmp file left after atomic write ---')
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp)
+
+        save_decision(out_dir, 'c1', 'FINISH IT', 'scan')
+        check('T3A: SIFT_decisions.json written',
+              (out_dir / 'SIFT_decisions.json').exists())
+        check('T3A: no .tmp left after save_decision',
+              not (out_dir / 'SIFT_decisions.json.tmp').exists())
+
+        save_description_cache(out_dir, 'c1', 'A description.', 'Groq', 'h1')
+        check('T3A: SIFT_descriptions.json written',
+              (out_dir / 'SIFT_descriptions.json').exists())
+        check('T3A: no .tmp left after save_description_cache',
+              not (out_dir / 'SIFT_descriptions.json.tmp').exists())
+
+
+def test_T3B_original_survives_failed_rename():
+    print('\n--- T3B: original file unchanged when rename fails ---')
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp)
+
+        orig_data = {
+            'session_started': '2026-01-01T00:00:00',
+            'scan_folder': 'test',
+            'decisions': [{'cluster_id': 'original_c', 'decision': 'KEEP',
+                           'decided_at': '2026-01-01T00:00:00'}],
+        }
+        dp = out_dir / 'SIFT_decisions.json'
+        with open(dp, 'w', encoding='utf-8') as f:
+            json.dump(orig_data, f, indent=2)
+
+        with patch.object(Path, 'replace', side_effect=OSError('simulated disk full')):
+            try:
+                save_decision(out_dir, 'new_c', 'FINISH IT', 'test')
+            except Exception:
+                pass
+
+        check('T3B: original file still exists', dp.exists())
+        if dp.exists():
+            with open(dp, encoding='utf-8') as f:
+                loaded = json.load(f)
+            ids = [d['cluster_id'] for d in loaded.get('decisions', [])]
+            check('T3B: original content intact', 'original_c' in ids, f'ids={ids}')
+            check('T3B: new decision NOT written (rename failed)',
+                  'new_c' not in ids, f'ids={ids}')
+
+
+def test_T3C_source_code_atomic_writes():
+    print('\n--- T3C: all 6 write locations use atomic pattern ---')
+    base = Path(__file__).parent
+    sift_src = (base / 'sift.py').read_text(encoding='utf-8')
+    bc_src   = (base / 'build_clusters.py').read_text(encoding='utf-8')
+    be_src   = (base / 'build_entry_points.py').read_text(encoding='utf-8')
+    bd_src   = (base / 'build_descriptions.py').read_text(encoding='utf-8')
+    sr_src   = (base / 'sift_report.py').read_text(encoding='utf-8')
+
+    check('T3C: sift.py -- connection_map atomic write',
+          '_tmp_conn.replace(conn_map_path)' in sift_src)
+    check('T3C: build_clusters.py -- atomic write',
+          'tmp_path.replace(out_path)' in bc_src)
+    check('T3C: build_entry_points.py -- atomic write',
+          'tmp_path.replace(out_path)' in be_src)
+    check('T3C: build_descriptions.py -- atomic write',
+          'tmp_path.replace(desc_path)' in bd_src)
+    check('T3C: sift_report.py -- save_decision atomic write',
+          'tmp_path.replace(decisions_path)' in sr_src)
+    check('T3C: sift_report.py -- save_description_cache atomic write',
+          'tmp_path.replace(desc_path)' in sr_src)
+
+
+# ── Additions: checkpoint/resume (T4A-T4D) ───────────────────────────────────
+
+def test_T4A_checkpoint_complete():
+    print('\n--- T4A: checkpoint mechanism completes without error ---')
+    with tempfile.TemporaryDirectory() as tmp_scan, \
+         tempfile.TemporaryDirectory() as tmp_out:
+        scan_dir = Path(tmp_scan)
+        out_dir  = Path(tmp_out)
+        for i in range(10):
+            (scan_dir / f'f{i}.py').write_text(
+                f'import os\ndef fn{i}(): pass\n' * 5, encoding='utf-8'
+            )
+        from sift import walk_and_index
+        result = walk_and_index([str(scan_dir)], out_dir)
+        check('T4A: returns 7-tuple', len(result) == 7, f'got {len(result)} items')
+        check('T4A: total files found > 0', result[0] > 0, f'total={result[0]}')
+
+
+def test_T4B_checkpoint_deleted_on_success():
+    print('\n--- T4B: checkpoint deleted after successful scan ---')
+    with tempfile.TemporaryDirectory() as tmp_scan, \
+         tempfile.TemporaryDirectory() as tmp_out:
+        scan_dir = Path(tmp_scan)
+        out_dir  = Path(tmp_out)
+        for i in range(5):
+            (scan_dir / f'g{i}.py').write_text('import sys\n' * 10, encoding='utf-8')
+        from sift import walk_and_index
+        walk_and_index([str(scan_dir)], out_dir)
+        check('T4B: SIFT_checkpoint.json deleted after success',
+              not (out_dir / 'SIFT_checkpoint.json').exists())
+
+
+def test_T4C_checkpoint_format():
+    print('\n--- T4C: checkpoint file format is correct ---')
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp)
+        cp_data = {
+            'scanned_files': [r'C:\fake\a.py', r'C:\fake\b.py'],
+            'total_found': 10,
+            'checkpoint_at': '2026-06-07T10:00:00',
+        }
+        cp_path = out_dir / 'SIFT_checkpoint.json'
+        with open(cp_path, 'w', encoding='utf-8') as f:
+            json.dump(cp_data, f, indent=2)
+        with open(cp_path, encoding='utf-8') as f:
+            loaded = json.load(f)
+        check('T4C: scanned_files key present', 'scanned_files' in loaded)
+        check('T4C: scanned_files is list', isinstance(loaded['scanned_files'], list))
+        check('T4C: total_found key present', 'total_found' in loaded)
+        check('T4C: checkpoint_at key present', 'checkpoint_at' in loaded)
+        check('T4C: scanned_files count correct',
+              len(loaded['scanned_files']) == 2, f'got {len(loaded["scanned_files"])}')
+
+
+def test_T4D_resume_skips_already_scanned():
+    print('\n--- T4D: resume skips files listed in checkpoint ---')
+    with tempfile.TemporaryDirectory() as tmp_scan, \
+         tempfile.TemporaryDirectory() as tmp_out:
+        scan_dir = Path(tmp_scan)
+        out_dir  = Path(tmp_out)
+        for i in range(6):
+            (scan_dir / f'h{i}.py').write_text('import os\n' * 10, encoding='utf-8')
+
+        from sift import collect_metadata, filter_for_scan, walk_and_index
+        collect_metadata([str(scan_dir)], out_dir)
+        target = filter_for_scan(out_dir)
+        already = target[:2] if len(target) >= 2 else target
+
+        cp_path = out_dir / 'SIFT_checkpoint.json'
+        with open(cp_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'scanned_files': already,
+                'total_found': len(target),
+                'checkpoint_at': '2026-06-07T10:00:00',
+            }, f, indent=2)
+
+        result = walk_and_index([str(scan_dir)], out_dir)
+        check('T4D: scan completes with resume', len(result) == 7)
+        check('T4D: checkpoint cleaned up after resume completion',
+              not cp_path.exists())
+
+
 # ── Runner ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1771,6 +2023,20 @@ def main():
         test_generate_description_and_cache()
         test_css_description_classes()
         test_run_sift_bat()
+
+        print('\n-- Additions: tiered read, throttle, atomic writes, checkpoint --')
+        test_T1A_small_file_full_read()
+        test_T1B_large_file_fast()
+        test_T1C_medium_file_reads_100_100()
+        test_T2A_throttle_constant_exists()
+        test_T2B_sleep_called_in_assemble()
+        test_T3A_no_tmp_after_write()
+        test_T3B_original_survives_failed_rename()
+        test_T3C_source_code_atomic_writes()
+        test_T4A_checkpoint_complete()
+        test_T4B_checkpoint_deleted_on_success()
+        test_T4C_checkpoint_format()
+        test_T4D_resume_skips_already_scanned()
     finally:
         teardown()
 

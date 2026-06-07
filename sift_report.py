@@ -476,8 +476,10 @@ def save_decision(output_dir, primary_id, decision, scan_folder):
         'decision':   decision,
         'decided_at': datetime.datetime.now().isoformat(),
     })
-    with open(decisions_path, 'w', encoding='utf-8') as f:
+    tmp_path = decisions_path.with_suffix('.tmp')
+    with open(tmp_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2)
+    tmp_path.replace(decisions_path)
 
 
 # ── Component 4: HTML renderers ───────────────────────────────────────────────
@@ -1025,8 +1027,10 @@ def save_description_cache(output_dir, cluster_id, description_text, tier_name, 
     if content_hash:
         descriptions[cluster_id]['content_hash'] = content_hash
     try:
-        with open(desc_path, 'w', encoding='utf-8') as _f:
+        tmp_path = desc_path.with_suffix('.tmp')
+        with open(tmp_path, 'w', encoding='utf-8') as _f:
             json.dump(descriptions, _f, indent=2)
+        tmp_path.replace(desc_path)
     except Exception:
         pass
 

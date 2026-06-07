@@ -156,8 +156,10 @@ def build_entry_points(output_dir):
     }
 
     out_path = output_dir / 'SIFT_entry_points.json'
-    with open(out_path, 'w', encoding='utf-8') as fout:
+    tmp_path = out_path.with_suffix('.tmp')
+    with open(tmp_path, 'w', encoding='utf-8') as fout:
         json.dump(result, fout, indent=2)
+    tmp_path.replace(out_path)
 
     print(f'  Output: {out_path}')
     return result

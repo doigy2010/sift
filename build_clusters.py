@@ -226,8 +226,10 @@ def build_clusters(output_dir):
     }
 
     out_path = output_dir / 'SIFT_clusters.json'
-    with open(out_path, 'w', encoding='utf-8') as fout:
+    tmp_path = out_path.with_suffix('.tmp')
+    with open(tmp_path, 'w', encoding='utf-8') as fout:
         json.dump(result, fout, indent=2)
+    tmp_path.replace(out_path)
 
     print(f'  {len(cluster_list)} clusters written')
     print(f'  {len(loose_files)} loose files')
