@@ -1,5 +1,6 @@
-import os, sys, json, datetime, tempfile
+import os, sys, json, datetime, tempfile, re
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 from sift import time_estimate, collect_metadata, filter_for_scan
@@ -25,7 +26,12 @@ from sift_report import (
     python_fallback_summary, generate_readback,
     find_start_with, render_readback_consent, render_readback_result,
     auto_save_report,
+    python_fallback_description, generate_description, save_description_cache,
     _BASE_CSS,
+)
+from build_descriptions import (
+    extract_signals, signals_to_purpose_labels, extract_domain_nouns,
+    detect_sub_projects, build_evidence_package, _compute_content_hash,
 )
 
 TEST_DIR  = Path(__file__).parent / 'test_fake_output'
@@ -1296,11 +1302,405 @@ def test_auto_save_report():
     save_dir.rmdir()
 
 
+# ── Intelligence layer: extract_signals (1A-1D) ────────────────────────────────
+
+def test_extract_signals():
+    print('\n--- extract_signals (1A-1D) ---')
+    with tempfile.TemporaryDirectory() as tmp:
+        # 1A: Python file with known imports + language detection
+        f_server = Path(tmp) / 'server.py'
+        f_server.write_text(
+            'import flask\nimport os\n\ndef run_app():\n    pass\n',
+            encoding='utf-8',
+        )
+        sig = extract_signals(f_server)
+        check('1A: language = Python',          sig['language'] == 'Python',          sig['language'])
+        check('1A: flask in imports',           'flask' in sig['imports'],            str(sig['imports']))
+        check('1A: os in imports',              'os' in sig['imports'],               str(sig['imports']))
+        check('1A: function name extracted',    'run_app' in sig['function_names'],   str(sig['function_names']))
+
+        # 1B: entry point detection
+        f_main = Path(tmp) / 'main.py'
+        f_main.write_text(
+            'def foo(): pass\n\nif __name__ == "__main__":\n    foo()\n',
+            encoding='utf-8',
+        )
+        sig_ep = extract_signals(f_main)
+        check('1B: entry_point = yes',          sig_ep['entry_point'] == 'yes',       sig_ep['entry_point'])
+
+        # 1C: docstring extraction
+        f_doc = Path(tmp) / 'tool.py'
+        f_doc.write_text(
+            '"""This is a vendor call tool."""\nimport sys\n',
+            encoding='utf-8',
+        )
+        sig_doc = extract_signals(f_doc)
+        check('1C: docstring not None',         sig_doc['docstring'] is not None,     repr(sig_doc['docstring']))
+        check('1C: docstring content correct',  'vendor call tool' in sig_doc['docstring'], repr(sig_doc['docstring']))
+
+        # 1D: non-existent file → default dict, no crash
+        sig_nx = extract_signals(Path(tmp) / 'nonexistent.py')
+        check('1D: non-existent file no crash', True)
+        check('1D: imports key present',        'imports' in sig_nx)
+        check('1D: imports is empty list',      sig_nx['imports'] == [],              str(sig_nx['imports']))
+
+
+# ── Intelligence layer: signals_to_purpose_labels + extract_domain_nouns (2A-2E) ──
+
+def test_purpose_labels_and_nouns():
+    print('\n--- signals_to_purpose_labels + extract_domain_nouns (2A-2E) ---')
+
+    # 2A: flask → 'serves web pages or an API'
+    labels_flask = signals_to_purpose_labels({'imports': ['flask']})
+    check('2A: flask label mapped',             'serves web pages or an API' in labels_flask, str(labels_flask))
+
+    # 2B: twilio higher specificity than flask → twilio label first
+    labels_both = signals_to_purpose_labels({'imports': ['twilio', 'flask']})
+    check('2B: twilio label present',           'makes phone calls or sends text messages' in labels_both, str(labels_both))
+    check('2B: twilio first (specificity=6)',   labels_both[0] == 'makes phone calls or sends text messages', str(labels_both))
+
+    # 2C: empty imports → []
+    check('2C: empty imports -> []',             signals_to_purpose_labels({'imports': []}) == [])
+
+    # 2D: domain nouns extracted from function names
+    sig_fns = {
+        'function_names': ['send_vendor_email', 'track_property', 'calculate_invoice'],
+        'class_names': [],
+    }
+    nouns = extract_domain_nouns(sig_fns)
+    check('2D: vendor extracted',               'vendor' in nouns,   str(nouns))
+    check('2D: property extracted',             'property' in nouns, str(nouns))
+    check('2D: invoice extracted',              'invoice' in nouns,  str(nouns))
+
+    # 2E: sensitive words stripped
+    sig_sensitive = {
+        'function_names': ['verify_password', 'decrypt_token', 'send_email'],
+        'class_names': [],
+    }
+    nouns_s = extract_domain_nouns(sig_sensitive)
+    check('2E: password not in nouns',          'password' not in nouns_s, str(nouns_s))
+    check('2E: token not in nouns',             'token' not in nouns_s,    str(nouns_s))
+    check('2E: email kept',                     'email' in nouns_s,        str(nouns_s))
+
+
+# ── Intelligence layer: detect_sub_projects (3A-3E) ────────────────────────────
+
+def test_detect_sub_projects_bd():
+    print('\n--- detect_sub_projects (3A-3E) ---')
+
+    a      = r'C:\proj\a.py'
+    b      = r'C:\proj\b.py'
+    c      = r'C:\proj\c.py'
+    d      = r'C:\proj\d.py'
+    shared = r'C:\proj\shared.py'
+
+    # 3A: A↔B mutual + C↔D mutual → two sub-projects
+    conn_3a = {a: {b: 1}, b: {a: 1}, c: {d: 1}, d: {c: 1}}
+    r3a = detect_sub_projects([a, b, c, d], conn_3a)
+    check('3A: 2 sub-projects',                 len(r3a['sub_projects']) == 2,       str(r3a['sub_projects']))
+    check('3A: no standalone',                  len(r3a['standalone']) == 0,         str(r3a['standalone']))
+    check('3A: no shared utilities',            len(r3a['shared_utilities']) == 0,   str(r3a['shared_utilities']))
+
+    # 3B: A→B only (one-way) → both standalone (no mutual edge)
+    conn_3b = {a: {b: 1}}
+    r3b = detect_sub_projects([a, b], conn_3b)
+    check('3B: no sub-projects (one-way)',       len(r3b['sub_projects']) == 0,       str(r3b['sub_projects']))
+    check('3B: both standalone',                len(r3b['standalone']) == 2,         str(r3b['standalone']))
+
+    # 3C: shared utility referenced by 2+ sub-projects
+    conn_3c = {
+        a: {b: 1, shared: 1}, b: {a: 1},
+        c: {d: 1, shared: 1}, d: {c: 1},
+    }
+    r3c = detect_sub_projects([a, b, c, d, shared], conn_3c)
+    check('3C: 2 sub-projects',                 len(r3c['sub_projects']) == 2,       str(r3c['sub_projects']))
+    check('3C: 1 shared utility',               len(r3c['shared_utilities']) == 1,   str(r3c['shared_utilities']))
+    check('3C: shared is correct file',         r3c['shared_utilities'][0] == shared)
+
+    # 3D: empty cluster → all empty
+    r3d = detect_sub_projects([], {})
+    check('3D: empty -> all lists empty',
+          r3d['sub_projects'] == [] and r3d['standalone'] == [] and r3d['shared_utilities'] == [])
+
+    # 3E: single-file cluster → standalone, no sub-projects
+    r3e = detect_sub_projects([a], {})
+    check('3E: single file is standalone',      a in r3e['standalone'])
+    check('3E: no sub-projects',                r3e['sub_projects'] == [])
+
+
+# ── Intelligence layer: build_evidence_package (4A-4E) ─────────────────────────
+
+def test_evidence_package_bd():
+    print('\n--- build_evidence_package (4A-4E) ---')
+    with tempfile.TemporaryDirectory() as tmp:
+        f1 = Path(tmp) / 'main.py'
+        f2 = Path(tmp) / 'utils.py'
+        f1.write_text(
+            'import flask\n\ndef run_server(): pass\n\nif __name__ == "__main__":\n    pass\n',
+            encoding='utf-8',
+        )
+        f2.write_text(
+            'import sqlite3\n\ndef store_vendor(vendor): pass\n',
+            encoding='utf-8',
+        )
+        cluster = {
+            'id': 'test_c_001', 'name': 'Test Project',
+            'folder': tmp, 'file_count': 2,
+            'last_touched': '2 weeks ago',
+            'files': [str(f1), str(f2)],
+        }
+        all_signals = {
+            str(f1): extract_signals(f1),
+            str(f2): extract_signals(f2),
+        }
+        sp_result = {
+            'sub_projects': [], 'standalone': [str(f1), str(f2)], 'shared_utilities': [],
+        }
+        pkg = build_evidence_package(cluster, all_signals, sp_result, Path(tmp))
+
+        # 4A: required fields all present
+        check('4A: cluster_name present',       'cluster_name:' in pkg,       pkg[:150])
+        check('4A: file_count present',         'file_count:' in pkg,         pkg[:150])
+        check('4A: purpose_signals present',    'purpose_signals:' in pkg,    pkg[:200])
+        check('4A: last_touched present',       'last_touched:' in pkg,       pkg[:300])
+        check('4A: content_hash present',       'content_hash:' in pkg,       pkg[:300])
+
+        # 4B: content hash reproducible
+        h1 = _compute_content_hash(cluster['files'])
+        h2 = _compute_content_hash(cluster['files'])
+        check('4B: hash reproducible',          h1 == h2,                     f'{h1} vs {h2}')
+        check('4B: hash is 32-char hex',        len(h1) == 32 and all(c in '0123456789abcdef' for c in h1))
+
+        # 4C: sensitive nouns stripped
+        f3 = Path(tmp) / 'auth.py'
+        f3.write_text('def verify_password_hash(pw): pass\ndef send_email(to): pass\n', encoding='utf-8')
+        sig3    = extract_signals(f3)
+        nouns3  = extract_domain_nouns(sig3)
+        check('4C: password not in nouns',      'password' not in nouns3,     str(nouns3))
+        check('4C: hash not in nouns',          'hash' not in nouns3,         str(nouns3))
+        check('4C: email kept',                 'email' in nouns3,            str(nouns3))
+
+        # 4D: package ≤ 2400 chars
+        check('4D: package <= 2400 chars',      len(pkg) <= 2400,             f'got {len(pkg)}')
+
+        # 4E: truncation — package with many sub-project lines still ≤ 2400
+        many_sp = {
+            'sub_projects': [[str(f1), str(f2)]] * 20,
+            'standalone': [], 'shared_utilities': [],
+        }
+        cluster_big = dict(cluster)
+        cluster_big['files'] = [str(f1), str(f2)] * 10
+        all_sig_big = {str(f1): all_signals[str(f1)], str(f2): all_signals[str(f2)]}
+        pkg_big = build_evidence_package(cluster_big, all_sig_big, many_sp, Path(tmp))
+        check('4E: truncated package <= 2400 chars', len(pkg_big) <= 2400,    f'got {len(pkg_big)}')
+        check('4E: cluster_name still present', 'cluster_name:' in pkg_big,   pkg_big[:150])
+
+
+# ── Intelligence layer: python_fallback_description (5A-5D) ────────────────────
+
+def test_python_fallback_description_new():
+    print('\n--- python_fallback_description (5A-5D) ---')
+
+    # 5A: evidence with 2 sub-projects
+    pkg_sp = (
+        'cluster_name: Vendor Toolkit\n'
+        'file_count: 7\n'
+        'languages: Python\n'
+        'purpose_signals: makes phone calls or sends text messages, sends emails\n'
+        'domain_vocabulary: vendor, property, campaign\n'
+        'readme_summary: none\n'
+        'sub_projects: 2\n'
+        '- vendor call: 3 files, makes phone calls or sends text messages\n'
+        '- email campaign: 4 files, sends emails\n'
+        'connection: parts are separate tools in the same folder\n'
+        'last_touched: 1 week ago\n'
+        'incomplete: none\n'
+        'content_hash: abc123\n'
+    )
+    desc_5a = python_fallback_description(pkg_sp)
+    check('5A: returns string',                 isinstance(desc_5a, str))
+    check('5A: cluster name present',           'Vendor Toolkit' in desc_5a,  desc_5a)
+    check('5A: sub-projects count (2) present', '2' in desc_5a,               desc_5a)
+    check('5A: last_touched present',           '1 week ago' in desc_5a,      desc_5a)
+
+    # 5B: single project, no sub-projects
+    pkg_single = (
+        'cluster_name: Data Processor\n'
+        'file_count: 3\n'
+        'languages: Python\n'
+        'purpose_signals: processes or analyses data\n'
+        'domain_vocabulary: property, report\n'
+        'readme_summary: none\n'
+        'sub_projects: 0\n'
+        'connection: single project\n'
+        'last_touched: 3 months ago\n'
+        'incomplete: none\n'
+        'content_hash: def456\n'
+    )
+    desc_5b = python_fallback_description(pkg_single)
+    check('5B: returns string',                 isinstance(desc_5b, str))
+    check('5B: cluster name present',           'Data Processor' in desc_5b,  desc_5b)
+    check('5B: purpose signal present',         'data' in desc_5b,            desc_5b)
+    check('5B: last_touched present',           '3 months ago' in desc_5b,    desc_5b)
+
+    # 5C: no purpose signals → "did not reveal" message
+    pkg_empty = (
+        'cluster_name: Mystery Files\n'
+        'file_count: 4\n'
+        'languages: none\n'
+        'purpose_signals: none\n'
+        'domain_vocabulary: none\n'
+        'readme_summary: none\n'
+        'sub_projects: 0\n'
+        'connection: single project\n'
+        'last_touched: over a year ago\n'
+        'incomplete: none\n'
+        'content_hash: ghi789\n'
+    )
+    desc_5c = python_fallback_description(pkg_empty)
+    check('5C: returns string',                 isinstance(desc_5c, str))
+    check('5C: no-signals message present',
+          'did not reveal' in desc_5c or 'no clear purpose' in desc_5c.lower(),
+          desc_5c)
+
+    # 5D: incomplete signals present → "unfinished" in output
+    pkg_incomplete = (
+        'cluster_name: Unfinished App\n'
+        'file_count: 2\n'
+        'languages: Python\n'
+        'purpose_signals: serves web pages or an API\n'
+        'domain_vocabulary: user, session\n'
+        'readme_summary: none\n'
+        'sub_projects: 0\n'
+        'connection: single project\n'
+        'last_touched: 2 weeks ago\n'
+        'incomplete: # TODO fix the login\n'
+        'content_hash: jkl000\n'
+    )
+    desc_5d = python_fallback_description(pkg_incomplete)
+    check('5D: unfinished mentioned',           'unfinished' in desc_5d.lower(), desc_5d)
+
+
+# ── Intelligence layer: generate_description + cache + render_card (6A-6E) ────
+
+def test_generate_description_and_cache():
+    print('\n--- generate_description + save_description_cache + render_card (6A-6E) ---')
+
+    pkg = (
+        'cluster_name: Test App\n'
+        'file_count: 3\n'
+        'languages: Python\n'
+        'purpose_signals: serves web pages or an API\n'
+        'domain_vocabulary: user, session\n'
+        'readme_summary: none\n'
+        'sub_projects: 0\n'
+        'connection: single project\n'
+        'last_touched: 2 weeks ago\n'
+        'incomplete: none\n'
+        'content_hash: test123\n'
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        output_dir = Path(tmp)
+
+        # 6A: valid Groq response used as description
+        with patch('sift_report.call_groq', return_value='This app serves web pages to visitors.'):
+            desc_6a, tier_6a = generate_description(pkg, output_dir, 'cluster_6a')
+        check('6A: description returned',       len(desc_6a) > 0,                   repr(desc_6a))
+        check('6A: tier is Groq',               'Groq' in tier_6a,                  tier_6a)
+        check('6A: mocked text returned',       desc_6a == 'This app serves web pages to visitors.')
+
+        # 6B: invalid Groq response (path) discarded → falls through to OpenRouter
+        with patch('sift_report.call_groq', return_value='See /home/user/app.py for details.'), \
+             patch('sift_report.call_openrouter', return_value='This app serves web pages.'):
+            desc_6b, tier_6b = generate_description(pkg, output_dir, 'cluster_6b')
+        check('6B: invalid path response discarded', 'OpenRouter' in tier_6b, tier_6b)
+        check('6B: clean OpenRouter response used',  'home/user' not in desc_6b)
+
+        # Test save_description_cache
+        save_description_cache(output_dir, 'cluster_save_test', 'A clean description.', 'Groq (free tier)', 'hash123')
+        desc_path = output_dir / 'SIFT_descriptions.json'
+        check('save_cache: file created',       desc_path.exists())
+        if desc_path.exists():
+            with open(desc_path, encoding='utf-8') as fh:
+                cached = json.load(fh)
+            check('save_cache: cluster_id present', 'cluster_save_test' in cached)
+            check('save_cache: description saved',
+                  cached.get('cluster_save_test', {}).get('description') == 'A clean description.')
+            check('save_cache: tier saved',
+                  cached.get('cluster_save_test', {}).get('tier') == 'Groq (free tier)')
+
+        # 6C: render_card with pre-populated description → shown in project-description
+        card_with_desc = {
+            'type': 'cluster', 'primary_id': 'cluster_with_desc',
+            'name': 'Email Tool', 'status': 'CAN RUN NOW',
+            'last_touched': '2 weeks ago', 'entry_point': r'C:\p\main.py',
+            'description': 'This tool sends emails to investors.',
+            'tier': 'Groq (free tier)',
+            'evidence_package': None,
+            'files': [], 'status_basis': 'ok',
+        }
+        html_6c = render_card(card_with_desc, 1, 1)
+        check('6C: project-description element present', '<p class="project-description">' in html_6c)
+        check('6C: description text shown',         'This tool sends emails to investors.' in html_6c)
+        check('6C: tier line shown',                'Groq (free tier)' in html_6c)
+        check('6C: description-tier element present', '<p class="description-tier">' in html_6c)
+
+        # 6D: render_card with no description and no evidence_package → derive_description
+        card_no_desc = {
+            'type': 'cluster', 'primary_id': 'cluster_no_desc',
+            'name': 'No Desc App', 'status': 'UNKNOWN',
+            'last_touched': 'over a year ago', 'entry_point': None,
+            'description': None, 'tier': None, 'evidence_package': None,
+            'files': [r'C:\p\main.py'], 'status_basis': '',
+        }
+        html_6d = render_card(card_no_desc, 1, 1)
+        check('6D: project-description element NOT shown', '<p class="project-description">' not in html_6d)
+        check('6D: ev-line fallback shown',        'ev-line' in html_6d)
+
+        # 6E: tier='python' → no tier line element; tier='Groq' → tier line element shown
+        card_tier_python = dict(card_with_desc)
+        card_tier_python['tier'] = 'python'
+        html_6e_py = render_card(card_tier_python, 1, 1)
+        check('6E: no description-tier element for python tier', '<p class="description-tier">' not in html_6e_py)
+
+        html_6e_groq = render_card(card_with_desc, 1, 1)
+        check('6E: description-tier element shown for Groq tier', '<p class="description-tier">' in html_6e_groq)
+
+
+def test_css_description_classes():
+    print('\n--- CSS: description classes (6 CSS) ---')
+    check('project-description class in CSS',   'project-description' in _BASE_CSS)
+    check('description-tier class in CSS',      'description-tier' in _BASE_CSS)
+    # description-tier color must not be darker than #888888
+    check('description-tier uses #888888',      'description-tier' in _BASE_CSS and '#888888' in _BASE_CSS)
+    # project-description must not use a dark color (darker than #888888)
+    forbidden = [
+        'color: #555', 'color:#555', 'color: #444', 'color:#444',
+        'color: #333', 'color:#333', 'color: #222', 'color:#222',
+    ]
+    for val in forbidden:
+        check(f'no dark color {val} in project-description',
+              not (val in _BASE_CSS), f'found: {val}')
+
+
+# ── Intelligence layer: run_sift.bat (7A-7B) ───────────────────────────────────
+
+def test_run_sift_bat():
+    print('\n--- run_sift.bat (7A-7B) ---')
+    bat_path = Path(__file__).parent / 'run_sift.bat'
+    check('bat file exists',                    bat_path.exists())
+    if bat_path.exists():
+        content = bat_path.read_text(encoding='utf-8', errors='replace')
+        check('7A: [3b/4] step present',        '3b/4' in content,                 'no [3b/4] found')
+        check('7B: build_descriptions.py step', 'build_descriptions.py' in content, 'not found in bat')
+
+
 # ── Runner ─────────────────────────────────────────────────────────────────────
 
 def main():
     print('=' * 55)
-    print('SIFT REPORT TEST — Components 1 through 5b')
+    print('SIFT REPORT TEST — Step 0 through Component 7')
     print('=' * 55)
 
     setup()
@@ -1359,6 +1759,18 @@ def main():
         test_css_no_dark_text_colors()
         test_css_button_size()
         test_auto_save_report()
+
+        print('\n-- Intelligence layer: build_descriptions --')
+        test_extract_signals()
+        test_purpose_labels_and_nouns()
+        test_detect_sub_projects_bd()
+        test_evidence_package_bd()
+
+        print('\n-- Intelligence layer: sift_report additions --')
+        test_python_fallback_description_new()
+        test_generate_description_and_cache()
+        test_css_description_classes()
+        test_run_sift_bat()
     finally:
         teardown()
 

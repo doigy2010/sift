@@ -1,4 +1,4 @@
-import os, sys, json, webbrowser, socket, datetime, collections
+import os, sys, json, re, webbrowser, socket, datetime, collections
 import urllib.request, urllib.error
 from pathlib import Path
 
@@ -50,6 +50,26 @@ def load_report_data(output_dir):
         merged['entry_point']  = ep.get('entry_point')
         merged['status_basis'] = ep.get('status_basis', '')
         clusters.append(merged)
+
+    # Component 5: merge evidence_package + description from SIFT_descriptions.json
+    desc_path    = output_dir / 'SIFT_descriptions.json'
+    descriptions = {}
+    if desc_path.exists():
+        try:
+            with open(desc_path, encoding='utf-8') as _f:
+                descriptions = json.load(_f)
+        except Exception:
+            pass
+    for c in clusters:
+        cid = c['id']
+        if cid in descriptions:
+            c['evidence_package'] = descriptions[cid].get('evidence_package')
+            c['description']      = descriptions[cid].get('description')
+            c['tier']             = descriptions[cid].get('tier')
+        else:
+            c['evidence_package'] = None
+            c['description']      = None
+            c['tier']             = None
 
     actionable_count = sum(
         1 for c in clusters if c['status'] in ('CAN RUN NOW', 'NEARLY THERE')
@@ -311,6 +331,10 @@ _BASE_CSS = (
     '.gc-name { font-size: 1.1rem; font-weight: bold; color: #f0f0f0;'
     '           margin-bottom: 0.3rem; }'
     '.gc-desc { font-size: 0.9rem; color: #888888; }'
+    '.project-description { color: #cccccc; font-size: 1rem; line-height: 1.8;'
+    '                        margin-bottom: 0.5rem; }'
+    '.description-tier { color: #888888; font-size: 0.78rem; margin-top: 0.25rem;'
+    '                    margin-bottom: 1rem; }'
 )
 
 STATUS_COLORS = {
@@ -458,7 +482,7 @@ def save_decision(output_dir, primary_id, decision, scan_folder):
 
 # ── Component 4: HTML renderers ───────────────────────────────────────────────
 
-def render_card(card, card_num, total_cards, group=None):
+def render_card(card, card_num, total_cards, group=None, output_dir=None):
     status       = card.get('status', 'UNKNOWN')
     color        = STATUS_COLORS.get(status, '#888888')
     name         = card['name']
@@ -478,15 +502,36 @@ def render_card(card, card_num, total_cards, group=None):
     ep      = card.get('entry_point')
     ep_text = 'Has a starting point.' if ep else 'No starting point found.'
 
+    # Description: cache hit → on-demand generate → derive_description fallback
+    description = card.get('description')
+    tier_name   = card.get('tier')
+    ep_pkg      = card.get('evidence_package')
+    if not description and ep_pkg and output_dir:
+        description, tier_name = generate_description(ep_pkg, output_dir, primary_id)
+        if description:
+            ch = ''
+            for _ln in ep_pkg.split('\n'):
+                if _ln.startswith('content_hash:'):
+                    ch = _ln.partition(':')[2].strip()
+                    break
+            save_description_cache(output_dir, primary_id, description, tier_name, ch)
+    if description:
+        tier_html = (
+            '<p class="description-tier">Described using ' + tier_name + '</p>'
+            if tier_name and tier_name != 'python' else ''
+        )
+        desc_html = '<p class="project-description">' + description + '</p>' + tier_html
+    else:
+        desc_html = '<p class="ev-line">' + derive_description(card) + '</p>'
+
     # Evidence block — evidence before decisions
-    desc = derive_description(card)
     evidence_html = (
         '<div class="status-label" style="color:' + color
         + ';border:1px solid ' + color + ';">' + status + '</div>'
         '<div class="card-name">' + name + '</div>'
         '<div class="evidence-block">'
-        '<p class="ev-line">' + desc + '</p>'
-        '<p class="ev-line">Last touched ' + last_touched + '.</p>'
+        + desc_html
+        + '<p class="ev-line">Last touched ' + last_touched + '.</p>'
         '<p class="ev-line">' + status_plain + ' ' + ep_text + '</p>'
         '</div>'
     )
@@ -826,6 +871,166 @@ def find_start_with(decisions_dict, review_queue):
     return None
 
 
+# ── Component 6 (intelligence layer): description generation ─────────────────
+
+def python_fallback_description(evidence_package_str):
+    """
+    Build a plain English description from an evidence package string.
+    Uses Q5 template from the intelligence layer design spec. No LLM required.
+    """
+    if not evidence_package_str or not evidence_package_str.strip():
+        return 'No evidence available for this project.'
+
+    fields   = {}
+    sp_lines = []
+    for line in evidence_package_str.split('\n'):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith('- ') and ':' in stripped:
+            sp_lines.append(stripped[2:])
+        elif ':' in stripped:
+            key, _, val = stripped.partition(':')
+            fields[key.strip()] = val.strip()
+
+    name         = fields.get('cluster_name', 'This project')
+    file_count   = fields.get('file_count', '0')
+    purpose_raw  = fields.get('purpose_signals', '')
+    purpose_labels = [
+        p.strip() for p in purpose_raw.split(',')
+        if p.strip() and p.strip() != 'none'
+    ]
+    last_touched = fields.get('last_touched', 'unknown')
+    n_sub_raw    = fields.get('sub_projects', '0')
+    try:
+        n_sub = int(n_sub_raw or '0')
+    except ValueError:
+        n_sub = 0
+    connection = fields.get('connection', 'single project')
+    incomplete = fields.get('incomplete', 'none')
+
+    parts = []
+
+    if not purpose_labels:
+        parts.append(
+            f"{name} contains {file_count} files. "
+            "This project's files did not reveal enough information to describe what they do."
+        )
+        parts.append(f"Last touched {last_touched}.")
+        return ' '.join(parts)
+
+    parts.append(f"{name} contains {file_count} files.")
+
+    if n_sub >= 2:
+        parts.append(f"It has {n_sub} separate parts:")
+        for sp_line in sp_lines:
+            label_part, _, rest = sp_line.partition(':')
+            rest = rest.strip()
+            sp_bits = [b.strip() for b in rest.split(',')]
+            sp_purposes = [
+                b for b in sp_bits
+                if b and not re.match(r'^\d+\s+files?$', b)
+            ]
+            if sp_purposes:
+                parts.append(
+                    f"— {label_part.strip()}: {' and '.join(sp_purposes[:2])}."
+                )
+        if connection == 'all parts work together':
+            parts.append("All parts work together.")
+        elif connection == 'parts are separate tools in the same folder':
+            parts.append("These are separate tools in the same folder.")
+        elif connection == 'mixed':
+            parts.append("Some parts share files; others are separate.")
+    else:
+        if len(purpose_labels) >= 2:
+            parts.append(f"It {purpose_labels[0]} and {purpose_labels[1]}.")
+        else:
+            parts.append(f"It {purpose_labels[0]}.")
+
+    parts.append(f"Last touched {last_touched}.")
+
+    if incomplete and incomplete.strip() not in ('none', ''):
+        parts.append("Some parts appear unfinished.")
+
+    return ' '.join(parts)
+
+
+def _valid_description(text):
+    """Return True if LLM response contains no file paths, extensions, or backticks."""
+    if not text or not text.strip():
+        return False
+    if '`' in text:
+        return False
+    if re.search(r'[/\\][a-zA-Z0-9]', text):
+        return False
+    if re.search(r'\b\w+\.(py|js|ts|html|css|json|bat|sh)\b', text):
+        return False
+    return True
+
+
+def generate_description(evidence_package_str, output_dir, cluster_id):
+    """
+    Generate a plain English description via LLM cascade.
+    Returns (description_text, tier_name). Never raises.
+    """
+    instruction = (
+        'You are describing a software project to the person who built it. '
+        'They have forgotten what it does. Write 3 to 5 plain English sentences. '
+        'State what each part does. State whether the parts work together or are separate tools. '
+        'Do not use file names, file paths, technical terms, or code. '
+        "Do not say 'this looks like' — only state what the evidence shows. "
+        'Do not recommend anything. Facts only.'
+    )
+    prompt = instruction + '\n\n' + evidence_package_str
+
+    try:
+        text = call_groq(prompt)
+        if _valid_description(text):
+            return text, 'Groq (free tier)'
+    except Exception:
+        pass
+
+    try:
+        text = call_openrouter(prompt)
+        if _valid_description(text):
+            return text, 'OpenRouter (free model)'
+    except Exception:
+        pass
+
+    try:
+        text = call_ollama(prompt)
+        if _valid_description(text):
+            return text, 'Ollama (local, no data sent)'
+    except Exception:
+        pass
+
+    text = python_fallback_description(evidence_package_str)
+    return text, 'python'
+
+
+def save_description_cache(output_dir, cluster_id, description_text, tier_name, content_hash):
+    """Update SIFT_descriptions.json with a generated description."""
+    desc_path    = Path(output_dir) / 'SIFT_descriptions.json'
+    descriptions = {}
+    if desc_path.exists():
+        try:
+            with open(desc_path, encoding='utf-8') as _f:
+                descriptions = json.load(_f)
+        except Exception:
+            pass
+    if cluster_id not in descriptions:
+        descriptions[cluster_id] = {}
+    descriptions[cluster_id]['description'] = description_text
+    descriptions[cluster_id]['tier']        = tier_name
+    if content_hash:
+        descriptions[cluster_id]['content_hash'] = content_hash
+    try:
+        with open(desc_path, 'w', encoding='utf-8') as _f:
+            json.dump(descriptions, _f, indent=2)
+    except Exception:
+        pass
+
+
 def auto_save_report(output_dir, decisions_dict, review_queue):
     """
     Auto-save an HTML summary to SIFT_report_summary.html in output_dir.
@@ -954,7 +1159,7 @@ if FLASK_AVAILABLE:
         if card['type'] == 'loose_file':
             html = render_loose_file_card(card, card_num + 1, total, group=group)
         else:
-            html = render_card(card, card_num + 1, total, group=group)
+            html = render_card(card, card_num + 1, total, group=group, output_dir=output_dir)
         return Response(html, mimetype='text/html')
 
     @app.route('/decide', methods=['POST'])

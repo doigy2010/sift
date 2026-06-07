@@ -740,6 +740,9 @@ def mode_scan(output_dir, scan_root, plain_english=False):
                     scanned_file_list.append(_line[6:].strip())
 
     connection_map = build_connection_map(scanned_file_list, store_path)
+    conn_map_path = output_dir / 'SIFT_connection_map.json'
+    with open(conn_map_path, 'w', encoding='utf-8') as _f:
+        json.dump(connection_map, _f, indent=2)
     cluster_map    = detect_clusters(connection_map, output_dir)
     entry_points   = find_entry_points(cluster_map, connection_map)
 

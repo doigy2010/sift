@@ -64,6 +64,15 @@ if errorlevel 1 (
 echo Done.
 echo.
 
+REM Step 3b: Build project descriptions
+echo [3b/4] Building project descriptions...
+python "%~dp0build_descriptions.py"
+if errorlevel 1 (
+    echo WARNING: build_descriptions.py failed. Descriptions will be skipped.
+)
+echo Done.
+echo.
+
 REM Step 4: Start report
 echo [4/4] Opening report in your browser...
 python "%~dp0sift_report.py"
