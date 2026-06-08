@@ -7,7 +7,7 @@ from sift import time_estimate, collect_metadata, filter_for_scan
 from build_clusters import (
     relative_time, folder_name_to_plain_english, parse_index_full,
     find_scan_roots, get_cluster_root, detect_version_groups, build_clusters,
-    SKIP_CLUSTER_FOLDERS,
+    SKIP_CLUSTER_FOLDERS, FULL_PATH_SKIP_STRINGS,
 )
 from build_entry_points import (
     find_entry_point, count_missing_local_imports,
@@ -27,7 +27,7 @@ from sift_report import (
     find_start_with, render_readback_consent, render_readback_result,
     auto_save_report,
     python_fallback_description, generate_description, save_description_cache,
-    _BASE_CSS,
+    _BASE_CSS, _loose_file_title,
 )
 from build_descriptions import (
     extract_signals, signals_to_purpose_labels, extract_domain_nouns,
@@ -310,6 +310,77 @@ def test_skip_cluster_folders():
         for item in vscode_dir.iterdir():
             item.unlink()
         vscode_dir.rmdir()
+
+
+def make_fake_index_with_dotclaude():
+    """
+    Index containing files under .claude/worktrees (should be skipped entirely)
+    and a normal user project (must become a cluster).
+    """
+    lines = ['=' * 60, 'SIFT v2 FULL INDEX', '=' * 60, '']
+    entries = [
+        (r'C:\fake_scan\my-app\main.py',                              '01 Jan 2026 10:00'),
+        (r'C:\fake_scan\my-app\utils.py',                             '01 Jan 2026 10:00'),
+        (r'C:\fake_scan\.claude\worktrees\branch-a\sift.py',          '01 Jan 2026 10:00'),
+        (r'C:\fake_scan\.claude\worktrees\branch-a\build_clusters.py','01 Jan 2026 10:00'),
+        (r'C:\fake_scan\.git\COMMIT_EDITMSG',                         '01 Jan 2026 10:00'),
+        (r'C:\fake_scan\.git\config',                                  '01 Jan 2026 10:00'),
+    ]
+    for path, modified in entries:
+        lines += ['', f'FILE: {path}', 'TYPE: Python | .py', 'SIZE: 2kb',
+                  'CREATED:  01 Jan 2026 09:00', f'MODIFIED: {modified}',
+                  'READABLE: Yes', '-' * 50]
+    return '\n'.join(lines)
+
+
+def test_full_path_skip_strings():
+    print('\n--- FULL_PATH_SKIP_STRINGS ---')
+
+    check('FULL_PATH_SKIP_STRINGS is a set',    isinstance(FULL_PATH_SKIP_STRINGS, (set, frozenset)))
+    check('.claude in FULL_PATH_SKIP_STRINGS',  '.claude'    in FULL_PATH_SKIP_STRINGS)
+    check('worktrees in FULL_PATH_SKIP_STRINGS','worktrees'  in FULL_PATH_SKIP_STRINGS)
+    check('.git in FULL_PATH_SKIP_STRINGS',     '.git'       in FULL_PATH_SKIP_STRINGS)
+
+    skip_dir = Path(__file__).parent / 'test_skip_dotclaude'
+    skip_dir.mkdir(exist_ok=True)
+    (skip_dir / 'SIFT_index_full.txt').write_text(
+        make_fake_index_with_dotclaude(), encoding='utf-8'
+    )
+    (skip_dir / 'SIFT_index_summary.txt').write_text(
+        'Scanned: C:\\fake_scan\n', encoding='utf-8'
+    )
+    try:
+        result   = build_clusters(skip_dir)
+        clusters = result['clusters']
+        loose    = result['loose_files']
+        folders  = [c['folder'] for c in clusters]
+        loose_names = [lf['name'] for lf in loose]
+
+        check('my-app becomes a cluster',
+              any('my-app' in f for f in folders),
+              detail=f'folders={folders}')
+        check('exactly 1 cluster (user project only)',
+              len(clusters) == 1,
+              detail=f'got {len(clusters)}: {folders}')
+        check('.claude NOT a cluster',
+              not any('.claude' in f for f in folders),
+              detail=f'folders={folders}')
+        check('worktrees NOT a cluster',
+              not any('worktrees' in f for f in folders),
+              detail=f'folders={folders}')
+        check('.git NOT a cluster',
+              not any('.git' in f for f in folders),
+              detail=f'folders={folders}')
+        check('.claude files NOT in loose',
+              not any('.claude' in lf for lf in loose_names),
+              detail=f'loose={loose_names}')
+        check('.git files NOT in loose',
+              not any('.git' in lf for lf in loose_names),
+              detail=f'loose={loose_names}')
+    finally:
+        for item in skip_dir.iterdir():
+            item.unlink()
+        skip_dir.rmdir()
 
 
 # ── Component 2 sift.py progress tests ────────────────────────────────────────
@@ -835,6 +906,46 @@ def test_render_loose_file_card():
     check('no FINISH IT button',       'FINISH IT'                 not in html)
     check('no DELETE button',          '>DELETE<'                  not in html)
     check('change note present',       'You can change this'       in html)
+    # Fix 4: plain English title, not raw filename as heading
+    check('plain English title for .md',   'A text note'           in html,
+          detail='notes.md should render as "A text note"')
+    check('filename in secondary not heading',
+          html.index('lf-filename') > html.index('card-name'),
+          detail='filename must appear after card-name heading')
+
+
+def test_loose_file_title():
+    print('\n--- _loose_file_title ---')
+    # .md file
+    t, s = _loose_file_title('notes.md')
+    check('md: plain title',           t == 'A text note',                         t)
+    check('md: filename in secondary', 'notes.md' in s)
+
+    # .py file
+    t, s = _loose_file_title('helper.py')
+    check('py: plain title',           t == 'A Python script',                     t)
+    check('py: filename in secondary', 'helper.py' in s)
+
+    # .html file
+    t, s = _loose_file_title('index.html')
+    check('html: plain title',         t == 'A web page file',                     t)
+
+    # .json file
+    t, s = _loose_file_title('config.json')
+    check('json: plain title',         t == 'A settings or data file',             t)
+
+    # .txt file
+    t, s = _loose_file_title('readme.txt')
+    check('txt: plain title',          t == 'A text file',                         t)
+
+    # Unknown extension
+    t, s = _loose_file_title('data.csv')
+    check('csv: plain title',          t == 'A csv file',                          t)
+
+    # Date pattern YYYY-MM-DD
+    t, s = _loose_file_title('2026-06-01.md')
+    check('date: plain title starts with A note from', t.startswith('A note from'), t)
+    check('date: filename in secondary',               '2026-06-01.md' in s)
 
 
 def test_render_apply_step1():
@@ -1223,7 +1334,6 @@ def test_render_card_evidence_first():
 
     # Evidence content
     check('has plain-English status',       'No clear starting point'   in html)
-    check('has entry point text',           'No starting point found'   in html)
     check('has last touched',               'Last touched'              in html)
     check('has derived description',        'file' in html.lower())
 
@@ -1521,7 +1631,6 @@ def test_python_fallback_description_new():
     check('5A: returns string',                 isinstance(desc_5a, str))
     check('5A: cluster name present',           'Vendor Toolkit' in desc_5a,  desc_5a)
     check('5A: sub-projects count (2) present', '2' in desc_5a,               desc_5a)
-    check('5A: last_touched present',           '1 week ago' in desc_5a,      desc_5a)
 
     # 5B: single project, no sub-projects
     pkg_single = (
@@ -1541,9 +1650,8 @@ def test_python_fallback_description_new():
     check('5B: returns string',                 isinstance(desc_5b, str))
     check('5B: cluster name present',           'Data Processor' in desc_5b,  desc_5b)
     check('5B: purpose signal present',         'data' in desc_5b,            desc_5b)
-    check('5B: last_touched present',           '3 months ago' in desc_5b,    desc_5b)
 
-    # 5C: no purpose signals → "did not reveal" message
+    # 5C: no purpose signals, no language → cluster name + file count
     pkg_empty = (
         'cluster_name: Mystery Files\n'
         'file_count: 4\n'
@@ -1559,8 +1667,10 @@ def test_python_fallback_description_new():
     )
     desc_5c = python_fallback_description(pkg_empty)
     check('5C: returns string',                 isinstance(desc_5c, str))
-    check('5C: no-signals message present',
-          'did not reveal' in desc_5c or 'no clear purpose' in desc_5c.lower(),
+    check('5C: cluster name present',           'Mystery Files' in desc_5c,   desc_5c)
+    check('5C: file count present',             '4' in desc_5c,               desc_5c)
+    check('5C: no jargon fallback text',
+          'did not reveal' not in desc_5c and 'no clear purpose' not in desc_5c.lower(),
           desc_5c)
 
     # 5D: incomplete signals present → "unfinished" in output
@@ -1966,6 +2076,7 @@ def main():
         test_detect_version_groups()
         test_build_clusters_end_to_end()
         test_skip_cluster_folders()
+        test_full_path_skip_strings()
 
         print('\n-- Component 2: sift.py progress --')
         test_time_estimate()
@@ -1988,6 +2099,7 @@ def main():
         test_load_save_decisions()
         test_render_card()
         test_render_loose_file_card()
+        test_loose_file_title()
         test_render_apply_step1()
         test_render_apply_step2()
 

@@ -19,6 +19,10 @@ SKIP_CLUSTER_FOLDERS = {
     'Roaming',
 }
 
+# Any folder whose FULL PATH contains one of these strings is skipped.
+# Catches nested tool/system folders regardless of depth.
+FULL_PATH_SKIP_STRINGS = {'.claude', 'worktrees', '.git', '__pycache__', 'node_modules'}
+
 VERSION_SUFFIX_RE = re.compile(
     r'[-_\s]*(v\d+|version\d+|final|backup|old|new|copy|\d+|revised|updated|archive|bak)\s*$',
     re.IGNORECASE
@@ -280,9 +284,10 @@ def build_clusters(output_dir):
         else:
             cluster_files[root].append(f)
 
-    # Drop software installation folders entirely — not user work, not loose files
+    # Drop software installation folders and system/tool nested paths entirely
     for folder in list(cluster_files.keys()):
-        if Path(folder).name in SKIP_CLUSTER_FOLDERS:
+        if (Path(folder).name in SKIP_CLUSTER_FOLDERS or
+                any(s in str(folder) for s in FULL_PATH_SKIP_STRINGS)):
             cluster_files.pop(folder)
 
     # Data folder detection: folder dominated by repetitively-named files (e.g. receipts)

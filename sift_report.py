@@ -4,6 +4,20 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 
+
+def load_env_file():
+    env_path = Path.home() / '.openclaw' / 'workspace' / '.env'
+    if not env_path.exists():
+        return
+    with open(env_path, 'r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, _, value = line.partition('=')
+                if key.strip() not in os.environ:
+                    os.environ[key.strip()] = value.strip().strip('"').strip("'")
+
+
 try:
     from flask import Flask, Response, redirect, url_for, request
     FLASK_AVAILABLE = True
@@ -79,6 +93,7 @@ def load_report_data(output_dir):
         'loose_files':      clusters_data.get('loose_files', []),
         'actionable_count': actionable_count,
         'scan_folder':      clusters_data.get('scan_folder', ''),
+        'data_folders':     clusters_data.get('data_folders', []),
     }
 
 
@@ -152,6 +167,63 @@ def render_no_scan_page():
     )
 
 
+def _format_bytes(n):
+    if n >= 1_073_741_824:
+        return f'{n / 1_073_741_824:.1f} GB'
+    if n >= 1_048_576:
+        return f'{n / 1_048_576:.1f} MB'
+    if n >= 1024:
+        return f'{int(n / 1024)} KB'
+    return f'{n} B'
+
+
+def _get_space_items(data):
+    """Return top 3 items by disk size for the space-awareness section.
+    Returns [] if no size data is available (e.g. test data with fake paths).
+    """
+    items = []
+
+    for c in data.get('clusters', []):
+        total = 0
+        for fp in c.get('files', []):
+            try:
+                total += os.path.getsize(fp)
+            except OSError:
+                pass
+        if total > 0:
+            folder = c.get('folder', '')
+            name   = c.get('name') or Path(folder).name or 'Unknown'
+            if '.claude' in str(folder) or 'worktrees' in str(folder):
+                context = 'Temporary folder — safe to remove'
+            else:
+                context = 'Active project folder'
+            items.append({'name': name, 'bytes': total, 'context': context})
+
+    for df in data.get('data_folders', []):
+        folder = df.get('folder', '')
+        if not folder:
+            continue
+        total = 0
+        try:
+            for entry in os.scandir(folder):
+                if entry.is_file(follow_symlinks=False):
+                    try:
+                        total += entry.stat().st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        if total > 0:
+            name = Path(folder).name or folder
+            items.append({'name': name, 'bytes': total,
+                          'context': 'Looks like a data or receipts folder'})
+
+    if not items:
+        return []
+    items.sort(key=lambda x: x['bytes'], reverse=True)
+    return items[:3]
+
+
 def render_opening_page(data):
     groups      = count_by_group(data)
     group_order = ['READY', 'NEARLY THERE', 'BROKEN', 'FRAGMENTS', 'LOOSE FILES']
@@ -164,6 +236,26 @@ def render_opening_page(data):
             '<span class="group-name">' + g + '</span>'
             '</div>'
         )
+
+    space_html = ''
+    space_items = _get_space_items(data)
+    if space_items:
+        space_rows = ''
+        for item in space_items:
+            space_rows += (
+                '<div class="space-row">'
+                '<div class="space-name">' + item['name'] + '</div>'
+                '<div class="space-size">' + _format_bytes(item['bytes']) + '</div>'
+                '<div class="space-ctx">' + item['context'] + '</div>'
+                '</div>'
+            )
+        space_html = (
+            '<div class="space-section">'
+            '<div class="space-heading">Largest things found:</div>'
+            + space_rows
+            + '</div>'
+        )
+
     return (
         '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
@@ -182,6 +274,13 @@ def render_opening_page(data):
         '.group-count { font-size: 2rem; font-weight: bold; color: #f0f0f0;'
         '               min-width: 3rem; text-align: right; }'
         '.group-name { font-size: 1rem; color: #888888; letter-spacing: 0.08em; }'
+        '.space-section { margin-bottom: 2.5rem; }'
+        '.space-heading { font-size: 0.82rem; color: #888888; letter-spacing: 0.08em;'
+        '                 margin-bottom: 0.8rem; }'
+        '.space-row { padding: 0.6rem 0; border-bottom: 1px solid #1a1a1a; }'
+        '.space-name { font-size: 1rem; color: #f0f0f0; }'
+        '.space-size { font-size: 0.82rem; color: #888888; }'
+        '.space-ctx  { font-size: 0.82rem; color: #888888; }'
         '.btn-start { background: #ffffff; color: #0f0f0f; border: none;'
         '             padding: 0.7rem 3.5rem; font-size: 1.25rem; font-weight: bold;'
         '             min-height: 3rem;'
@@ -193,7 +292,8 @@ def render_opening_page(data):
         '<div class="opening-head">I looked at your machine.'
         ' Here is what I found.</div>'
         '<div class="group-summary">' + rows + '</div>'
-        '<a href="/groups" class="btn-start">START REVIEWING</a>'
+        + space_html
+        + '<a href="/groups" class="btn-start">START REVIEWING</a>'
         '</div>'
         '</body></html>'
     )
@@ -203,21 +303,29 @@ def render_group_selection(data):
     """Screen 2: group selection. Shows 5 groups with counts + one-line description."""
     groups = count_by_group(data)
     GROUP_DESC = {
-        'READY':        'These projects have a working entry point. You can run them now.',
-        'NEARLY THERE': 'These projects are close. One or two things are missing.',
-        'BROKEN':       'These projects cannot run. Something critical is missing.',
-        'FRAGMENTS':    'Files that belong together but have no clear starting point.',
-        'LOOSE FILES':  'Files not attached to any project.',
+        'READY':        'These work right now. Start here if you want to pick something up today.',
+        'NEARLY THERE': 'Close to working. One or two things are missing. Worth a look.',
+        'BROKEN':       'Something is missing that stops these running. They need attention before you can use them.',
+        'FRAGMENTS':    'Groups of files that belong together but have no clear way to start. May need finishing.',
+        'LOOSE FILES':  'Single files not attached to anything. Decide whether to keep them or move them out of the way.',
+    }
+    GROUP_CSS = {
+        'READY':        'gc-colour-ready',
+        'NEARLY THERE': 'gc-colour-nearly',
+        'BROKEN':       'gc-colour-broken',
+        'FRAGMENTS':    'gc-colour-frags',
+        'LOOSE FILES':  'gc-colour-loose',
     }
     group_order = ['READY', 'NEARLY THERE', 'BROKEN', 'FRAGMENTS', 'LOOSE FILES']
     rows = ''
     for g in group_order:
-        n    = groups[g]
-        desc = GROUP_DESC[g]
-        word = 'item' if n == 1 else 'items'
+        n       = groups[g]
+        desc    = GROUP_DESC[g]
+        colour  = GROUP_CSS[g]
+        word    = 'item' if n == 1 else 'items'
         if n > 0:
             rows += (
-                '<a href="/review?group=' + g.replace(' ', '%20') + '" class="group-card">'
+                '<a href="/review?group=' + g.replace(' ', '%20') + '" class="group-card ' + colour + '">'
                 '<div class="gc-count">' + str(n) + ' ' + word + '</div>'
                 '<div class="gc-name">' + g + '</div>'
                 '<div class="gc-desc">' + desc + '</div>'
@@ -225,7 +333,7 @@ def render_group_selection(data):
             )
         else:
             rows += (
-                '<div class="group-card group-card-empty">'
+                '<div class="group-card group-card-empty ' + colour + '">'
                 '<div class="gc-count">0 items</div>'
                 '<div class="gc-name">' + g + '</div>'
                 '<div class="gc-desc">' + desc + '</div>'
@@ -331,6 +439,16 @@ _BASE_CSS = (
     '.gc-name { font-size: 1.1rem; font-weight: bold; color: #f0f0f0;'
     '           margin-bottom: 0.3rem; }'
     '.gc-desc { font-size: 0.9rem; color: #888888; }'
+    '.gc-colour-ready   { border-left: 4px solid #3dd68c; }'
+    '.gc-colour-ready   .gc-count { color: #3dd68c; }'
+    '.gc-colour-nearly  { border-left: 4px solid #fb923c; }'
+    '.gc-colour-nearly  .gc-count { color: #fb923c; }'
+    '.gc-colour-broken  { border-left: 4px solid #f2614a; }'
+    '.gc-colour-broken  .gc-count { color: #f2614a; }'
+    '.gc-colour-frags   { border-left: 4px solid #5b9cf6; }'
+    '.gc-colour-frags   .gc-count { color: #5b9cf6; }'
+    '.gc-colour-loose   { border-left: 4px solid #888888; }'
+    '.lf-filename { color: #888888; font-size: 0.82rem; margin-top: 0.3rem; }'
     '.project-description { color: #cccccc; font-size: 1rem; line-height: 1.8;'
     '                        margin-bottom: 0.5rem; }'
     '.description-tier { color: #888888; font-size: 0.78rem; margin-top: 0.25rem;'
@@ -397,32 +515,38 @@ def build_review_queue(data, group_filter=None):
             for gid in group_ids:
                 consumed.add(gid)
             queue.append({
-                'type':           'version_group',
-                'cluster_ids':    group_ids,
-                'primary_id':     c['id'],
-                'name':           c['name'],
-                'file_count':     sum(x['file_count'] for x in group_clusters),
-                'last_touched':   c['last_touched'],
-                'status':         c['status'],
-                'group_clusters': group_clusters,
-                'entry_point':    c.get('entry_point'),
-                'status_basis':   c.get('status_basis', ''),
+                'type':             'version_group',
+                'cluster_ids':      group_ids,
+                'primary_id':       c['id'],
+                'name':             c['name'],
+                'file_count':       sum(x['file_count'] for x in group_clusters),
+                'last_touched':     c['last_touched'],
+                'status':           c['status'],
+                'group_clusters':   group_clusters,
+                'entry_point':      c.get('entry_point'),
+                'status_basis':     c.get('status_basis', ''),
+                'description':      c.get('description'),
+                'evidence_package': c.get('evidence_package'),
+                'tier':             c.get('tier'),
             })
 
     for c in clusters:
         if c['id'] in consumed:
             continue
         queue.append({
-            'type':         'cluster',
-            'cluster_ids':  [c['id']],
-            'primary_id':   c['id'],
-            'name':         c['name'],
-            'file_count':   c['file_count'],
-            'last_touched': c['last_touched'],
-            'status':       c['status'],
-            'files':        c.get('files', []),
-            'entry_point':  c.get('entry_point'),
-            'status_basis': c.get('status_basis', ''),
+            'type':             'cluster',
+            'cluster_ids':      [c['id']],
+            'primary_id':       c['id'],
+            'name':             c['name'],
+            'file_count':       c['file_count'],
+            'last_touched':     c['last_touched'],
+            'status':           c['status'],
+            'files':            c.get('files', []),
+            'entry_point':      c.get('entry_point'),
+            'status_basis':     c.get('status_basis', ''),
+            'description':      c.get('description'),
+            'evidence_package': c.get('evidence_package'),
+            'tier':             c.get('tier'),
         })
         consumed.add(c['id'])
 
@@ -534,8 +658,10 @@ def render_card(card, card_num, total_cards, group=None, output_dir=None):
         '<div class="evidence-block">'
         + desc_html
         + '<p class="ev-line">Last touched ' + last_touched + '.</p>'
-        '<p class="ev-line">' + status_plain + ' ' + ep_text + '</p>'
-        '</div>'
+        + ('<p class="ev-line">' + status_plain + ' ' + ep_text + '</p>'
+           if ep else
+           ('<p class="ev-line">' + status_plain + '</p>' if status_plain else ''))
+        + '</div>'
     )
 
     # Version group detail (versions shown together)
@@ -585,13 +711,19 @@ def render_card(card, card_num, total_cards, group=None, output_dir=None):
     )
 
     # Technical detail hidden — opt-in only
-    ep_val    = ep or 'none found'
-    sb        = card.get('status_basis') or 'no detail available'
+    ep_val  = Path(ep).name if ep else 'none found'
+    sb_raw  = card.get('status_basis') or 'no detail available'
+    sb_clean = re.sub(
+        r'(\d+)\s+local imports? not found in cluster',
+        lambda m: f'Missing pieces: {m.group(1)} file{"s" if int(m.group(1)) != 1 else ""} '
+                  'this project needs are not in this folder',
+        sb_raw,
+    )
     tech_html = (
         '<details><summary>Show technical detail</summary>'
         '<div class="tech-detail">'
-        'Entry point: <code>' + ep_val + '</code><br>'
-        'Basis: ' + sb
+        'Starting file: <code>' + ep_val + '</code><br>'
+        + sb_clean
         + '</div></details>'
     )
 
@@ -602,6 +734,51 @@ def render_card(card, card_num, total_cards, group=None, output_dir=None):
 
     body = evidence_html + vg_html + form_html + tech_html + back_html
     return _page(body)
+
+
+_DATE_PAT = re.compile(r'^(\d{4}[-_]\d{2}[-_]\d{2})')
+
+
+def _loose_file_title(name):
+    """Return (primary_title, secondary_html) for a loose file card.
+    primary_title is plain English. secondary_html renders the filename in grey.
+    """
+    stem = Path(name).stem
+    ext  = Path(name).suffix.lower()
+
+    m = _DATE_PAT.match(stem)
+    if m:
+        date_str = m.group(1).replace('_', '-')
+        try:
+            dt = datetime.datetime.strptime(date_str, '%Y-%m-%d')
+            d  = (datetime.datetime.now() - dt).days
+            if d <= 0:     rel = 'today'
+            elif d == 1:   rel = 'yesterday'
+            elif d < 7:    rel = f'{d} days ago'
+            elif d < 14:   rel = '1 week ago'
+            elif d < 30:   rel = f'{d // 7} weeks ago'
+            elif d < 60:   rel = '1 month ago'
+            elif d < 365:  rel = f'{d // 30} months ago'
+            else:           rel = 'over a year ago'
+            primary = f'A note from {rel}'
+        except ValueError:
+            primary = 'A text note'
+    elif ext == '.md':
+        primary = 'A text note'
+    elif ext == '.py':
+        primary = 'A Python script'
+    elif ext == '.html':
+        primary = 'A web page file'
+    elif ext == '.json':
+        primary = 'A settings or data file'
+    elif ext == '.txt':
+        primary = 'A text file'
+    else:
+        label   = ext.lstrip('.') if ext else 'unknown'
+        primary = f'A {label} file'
+
+    secondary = '<div class="lf-filename">' + name + '</div>'
+    return primary, secondary
 
 
 def render_loose_file_card(card, card_num, total_cards, group=None):
@@ -616,10 +793,12 @@ def render_loose_file_card(card, card_num, total_cards, group=None):
         '<a href="/groups" class="back-link">Back to groups</a>'
         if group else ''
     )
+    plain_title, fname_html = _loose_file_title(name)
     body = (
         '<div class="loose-tag">loose file, not connected to any project</div>'
-        '<div class="card-name">' + name + '</div>'
-        '<div class="card-desc">Last touched ' + last_touched + '</div>'
+        '<div class="card-name">' + plain_title + '</div>'
+        + fname_html
+        + '<div class="card-desc">Last touched ' + last_touched + '</div>'
         '<p class="loose-note">Nothing here is deleted. These options only flag the file.</p>'
         '<form action="/decide" method="POST">'
         '<input type="hidden" name="primary_id" value="' + primary_id + '">'
@@ -914,11 +1093,40 @@ def python_fallback_description(evidence_package_str):
     parts = []
 
     if not purpose_labels:
-        parts.append(
-            f"{name} contains {file_count} files. "
-            "This project's files did not reveal enough information to describe what they do."
-        )
-        parts.append(f"Last touched {last_touched}.")
+        lang_str   = fields.get('languages', '')
+        lang_list  = [l.strip() for l in lang_str.split(',')
+                      if l.strip() and l.strip() != 'none']
+        vocab_str  = fields.get('domain_vocabulary', '')
+        vocab_list = [v.strip() for v in vocab_str.split(',')
+                      if v.strip() and v.strip() != 'none']
+
+        only_docs  = (bool(lang_list) and
+                      all(l in ('Markdown', 'Text', 'YAML', 'TOML', 'CSV')
+                          for l in lang_list))
+        has_web    = any(l in ('HTML', 'CSS', 'JavaScript', 'TypeScript',
+                               'React/JSX', 'React/TSX', 'SCSS')
+                         for l in lang_list)
+        has_python = 'Python' in lang_list
+
+        if only_docs:
+            parts.append(
+                f"{name} is a collection of {file_count} notes and documents."
+            )
+        elif has_python and has_web:
+            parts.append(
+                f"{name} contains {file_count} Python and web files."
+            )
+        elif has_web:
+            parts.append(f"{name} is a web project with {file_count} files.")
+        elif has_python:
+            parts.append(f"{name} contains {file_count} Python files.")
+        else:
+            parts.append(f"{name} contains {file_count} files.")
+
+        if vocab_list:
+            parts.append("Topics found: " + ', '.join(vocab_list[:4]) + ".")
+        if incomplete and incomplete.strip() not in ('none', ''):
+            parts.append("Some parts appear unfinished.")
         return ' '.join(parts)
 
     parts.append(f"{name} contains {file_count} files.")
@@ -948,8 +1156,6 @@ def python_fallback_description(evidence_package_str):
             parts.append(f"It {purpose_labels[0]} and {purpose_labels[1]}.")
         else:
             parts.append(f"It {purpose_labels[0]}.")
-
-    parts.append(f"Last touched {last_touched}.")
 
     if incomplete and incomplete.strip() not in ('none', ''):
         parts.append("Some parts appear unfinished.")
@@ -1254,6 +1460,7 @@ def find_free_port():
 
 
 def main():
+    load_env_file()
     if not FLASK_AVAILABLE:
         print('Flask is required. Install it with:')
         print('  pip install flask')
